@@ -2,6 +2,8 @@
 
 A collection of tests and benchmarks for my own research.
 
+I originally created this repository to learn CUDA through hands-on coding. Now, I use it to run various micro-experiments that help me quickly develop new ideas.
+
 ## Requirements
 
 - Thunderkittens
