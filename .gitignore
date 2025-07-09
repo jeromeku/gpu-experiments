@@ -1,0 +1,12 @@
+bin/
+profiler/
+*.d
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+venv/
+uftrace.data/
+uftrace.data.old/
+gmon.out
+.vscode/
+.DS_Store
