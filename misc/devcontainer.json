@@ -1,0 +1,18 @@
+{
+    "name": "Stuart's CUDA Container",
+    "build": {
+      "dockerfile": "Dockerfile",
+      "context": "."
+    },
+    "customizations": {
+      "vscode": {
+        "extensions": ["ms-vscode.cpptools-extension-pack", "nvidia.nsight-vscode-edition", "ms-python.python", "fabiospampinato.vscode-diff"]
+      }
+    },
+    "runArgs": ["--gpus", "all", "--privileged", "--shm-size=16g"], // /dev/shm required by nccl
+    "settings": {},
+    "postCreateCommand": "",
+    "remoteUser": "root",
+    "workspaceFolder": "/ThunderKittens" // this enables starting at non-bound directory
+                                         // but note that there will exist /workspaces which is bound to host volume
+}

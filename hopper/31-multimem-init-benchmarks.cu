@@ -1,0 +1,331 @@
+/*
+
+cudaSetDevice: 691.504 ms
+cudaSetDevice: 104.139 ms
+cudaSetDevice: 70.1517 ms
+cuInit: 0.00163 ms
+1. Query Multicast Support: 0.001371 ms
+2. Create a Multicast Handle with cuMulticastCreate: 0.020916 ms
+3. Add devices to MC Handle: 46.5719 ms
+4. Allocate physical memories: 373.422 ms
+5. Bind physical memories to mcHandle: 0.332828 ms
+6. Bind physical memories and mcHandle to Virtual Addresses: 29.2956 ms
+...
+Time for 256 MiB allreduce using multimem: 4.828802 ms
+...
+Cleanup: 1.45144 ms
+Done
+
+*/
+
+#include "multi-gpu.cuh"
+
+constexpr int NUM_DEVICES = 8;
+constexpr int SIZE = 256 * 1024 * 1024;
+
+__global__ void all_reduce_float32_sum(float *data, int nelem);
+__global__ void stupid_load_store(float *dst, float *src, int nelem);
+
+int main() {
+
+    assert(NUM_DEVICES > 1);
+    assert(SIZE >= 1024 * 1024 && SIZE % (1024 * 1024) == 0);
+
+    std::cout << std::endl;
+    benchmark("cudaSetDevice", [] {
+        CUDACHECK(cudaSetDevice(1));
+    });
+    benchmark("cudaSetDevice", [] {
+        CUDACHECK(cudaSetDevice(2));
+    });
+    benchmark("cudaSetDevice", [] {
+        CUDACHECK(cudaSetDevice(0));
+    });
+    benchmark("cuInit", [] {
+        CUCHECK(cuInit(0));
+    });
+
+    /*
+        1. Query Multicast Support
+    */
+    benchmark("1. Query Multicast Support", [] {
+        for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+            CUdevice dev;
+            CUCHECK(cuDeviceGet(&dev, dev_idx));
+
+            int deviceSupportsMultiCast;
+            CUCHECK(cuDeviceGetAttribute(
+                &deviceSupportsMultiCast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, dev));
+
+            if (!deviceSupportsMultiCast) {
+                fprintf(stderr, "Device %d does not support Multicast Objects\n", dev_idx);
+                exit(1);
+            }
+        }
+    });
+
+    /*
+        2. Create a Multicast Handle with cuMulticastCreate.
+    */
+    size_t granularity;
+    size_t size;
+    CUmemGenericAllocationHandle mcHandle;
+    CUmulticastObjectProp mcProp = {};
+    benchmark("2. Create a Multicast Handle with cuMulticastCreate", [&size, &granularity, &mcHandle, &mcProp] {
+        mcProp.numDevices = NUM_DEVICES;
+        mcProp.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR; // single node
+        mcProp.flags = 0; // SBZ
+        // mcProp.handleTypes = CU_MEM_HANDLE_TYPE_FABRIC; // multiple nodes/processes
+
+        granularity = 0;
+        CUCHECK(cuMulticastGetGranularity( // or CU_MULTICAST_GRANULARITY_MINIMUM
+            &granularity, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED)); 
+
+        // 2MiB on H100 machines apparently
+        // printf("Recommended multicast granularity: %luMiB\n", granularity / 1024 / 1024);
+        size = (1 + (SIZE - 1) / granularity) * granularity; // round UP to nearest granularity
+        mcProp.size = size;
+        // Create Multicast Object (no devices and no physical memory associated yet)
+        
+        CUCHECK(cuMulticastCreate(&mcHandle, &mcProp));
+    });
+
+    benchmark("3. Add devices to MC Handle", [&mcHandle] {
+        for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+            CUdevice dev;
+            CUCHECK(cuDeviceGet(&dev, dev_idx));
+            CUCHECK(cuMulticastAddDevice(mcHandle, dev));
+        }
+    });
+
+    /*
+        5. For each participating GPU bind physical memory allocated with 
+           cuMemCreate as described above to the Multicast Handle. All 
+           devices need to be added to the Multicast Team before binding 
+           memory on any device.
+    */
+    CUmemGenericAllocationHandle memHandles[NUM_DEVICES];
+
+    benchmark("4. Allocate physical memories", [&size, &memHandles] {
+        for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+            CUDACHECK(cudaSetDevice(dev_idx));
+
+            CUmemAllocationProp memProp = {};
+            memProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            memProp.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+            memProp.location.id = dev_idx;
+            memProp.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+
+            size_t mem_granularity = 0;
+            CUCHECK(cuMemGetAllocationGranularity( // or CU_MEM_ALLOC_GRANULARITY_MINIMUM
+                &mem_granularity, &memProp, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+            // printf("Recommended mem granularity (dev %d): %luMiB\n", dev_idx, mem_granularity / 1024 / 1024);
+            if (size % mem_granularity != 0) {
+                fprintf(stderr, "Size must be a multiple of mem granularity\n");
+                exit(1);
+            }
+
+            // Allocate physical memory on the device
+            CUCHECK(cuMemCreate(&memHandles[dev_idx], size, &memProp, 0));
+        }
+    });
+
+    benchmark("5. Bind physical memories to mcHandle", [&size, &mcHandle, &memHandles] {
+        for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+            // Bind the physical memory to the multicast handle
+            CUDACHECK(cudaSetDevice(dev_idx));
+            CUCHECK(cuMulticastBindMem(
+                mcHandle, /*mcOffset=*/0, memHandles[dev_idx], /*memOffset=*/0, size, 0));
+        }
+    });
+
+    /*
+        6. Reserve an address range, map the Multicast Handle and set Access 
+           Rights as described above for regular Unicast mappings. Unicast 
+           and Multicast mappings to the same physical memory are possible.
+    */
+    CUdeviceptr mcPtrs[NUM_DEVICES];
+    CUdeviceptr memPtrs[NUM_DEVICES];
+
+    benchmark("6. Bind physical memories and mcHandle to Virtual Addresses", [&size, &granularity, &mcHandle, &memHandles, &mcPtrs, &memPtrs] {
+        for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+            CUDACHECK(cudaSetDevice(dev_idx));
+        
+            CUCHECK(cuMemAddressReserve(&mcPtrs[dev_idx], size, granularity, 0, 0));
+            CUCHECK(cuMemAddressReserve(&memPtrs[dev_idx], size, granularity, 0, 0));
+
+            // Bind VAs to the multicast handle and physical memory
+            // This way, we can choose to write to the same physical location
+            // either with or without multicasting
+            CUCHECK(cuMemMap(mcPtrs[dev_idx], size, 0, mcHandle, 0));
+            CUCHECK(cuMemMap(memPtrs[dev_idx], size, 0, memHandles[dev_idx], 0));
+
+            // Remember to set access AFTER mapping
+            CUmemAccessDesc desc[1];
+            desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            desc[0].location.id = dev_idx;
+            desc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            CUCHECK(cuMemSetAccess(mcPtrs[dev_idx], size, desc, 1));
+            CUCHECK(cuMemSetAccess(memPtrs[dev_idx], size, desc, 1));
+        }
+    });
+
+    /*
+        Setup the data
+    */
+    assert(size % sizeof(float) == 0);
+
+    int nelem = size / sizeof(float);
+    float **host_mats = (float**)malloc(NUM_DEVICES * sizeof(float*));
+    srand(static_cast<unsigned int>(time(nullptr))); // random seed
+
+    for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+        host_mats[dev_idx] = (float*)malloc(size);
+        printf("Device %d: ", dev_idx);
+        for (int i = 0; i < nelem; ++i) {
+            host_mats[dev_idx][i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+            if (i < 10)
+                printf("%f ", host_mats[dev_idx][i]);
+        }
+        printf("... (%d elements)\n", nelem);
+    }
+
+    float *expected = (float*)malloc(size);
+    printf("Expected: ");
+    for (int i = 0; i < nelem; ++i) {
+        expected[i] = 0.0f;
+        for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+            expected[i] += host_mats[dev_idx][i];
+        }
+        if (i < 10)
+            printf("%f ", expected[i]);
+    }
+    printf("... (%d elements)\n", nelem);
+
+    for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+        CUDACHECK(cudaSetDevice(dev_idx));
+        CUDACHECK(cudaMemcpy((void*)memPtrs[dev_idx], host_mats[dev_idx], size, cudaMemcpyHostToDevice));
+    }
+
+    /*
+        Perform the reduction
+    */
+    printf("Performing reduction...\n");
+
+
+    // We will measure performance
+    // Unfortunately, cudaEvent does not work with multimem for some reason
+    // TODO: I think multimem.ld_reduce does lazy execution; must compare the entire flow
+
+    // As a reference, first do a stupid load-store, check time
+    CUDACHECK(cudaSetDevice(1));
+    float *dummy;
+    CUDACHECK(cudaMalloc(&dummy, size));
+    auto start = std::chrono::high_resolution_clock::now();
+    stupid_load_store<<<(nelem + 255) / 256, 256>>>((float*)dummy, (float*)memPtrs[1], nelem);
+    CUDACHECK(cudaDeviceSynchronize());
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    printf("Time for %d MiB plain load-store: %f ms\n", SIZE / 1024 / 1024, elapsed.count() * 1e3);
+    CUDACHECK(cudaFree(dummy));
+    
+    // Perfrorm the reduction
+    // WLOG, we will perform the reduction on the first device
+    CUDACHECK(cudaSetDevice(0));
+    start = std::chrono::high_resolution_clock::now();
+    all_reduce_float32_sum<<<(nelem / 4 + 255) / 256, 256>>>((float*)mcPtrs[0], nelem);
+    CUDACHECK(cudaDeviceSynchronize());
+    end = std::chrono::high_resolution_clock::now();
+    elapsed = end - start;
+    printf("Time for %d MiB allreduce using multimem: %f ms\n", SIZE / 1024 / 1024, elapsed.count() * 1e3);
+
+    // Do one more load-store to check if this is lazily happening
+    CUDACHECK(cudaSetDevice(2));
+    CUDACHECK(cudaMalloc(&dummy, size));
+    start = std::chrono::high_resolution_clock::now();
+    stupid_load_store<<<(nelem + 255) / 256, 256>>>((float*)dummy, (float*)memPtrs[2], nelem);
+    CUDACHECK(cudaDeviceSynchronize());
+    end = std::chrono::high_resolution_clock::now();
+    elapsed = end - start;
+    printf("Time for %d MiB load-store after multimem: %f ms\n", SIZE / 1024 / 1024, elapsed.count() * 1e3);
+    CUDACHECK(cudaFree(dummy));
+
+    /* 
+        Bring back data
+    */
+    for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+        CUDACHECK(cudaSetDevice(dev_idx));
+        CUDACHECK(cudaMemcpy(host_mats[dev_idx], (void*)memPtrs[dev_idx], size, cudaMemcpyDeviceToHost));
+    }
+
+    /*
+        Verify the results
+    */
+    float TOL = 1e-5;
+    for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+        printf("Device %d: ", dev_idx);
+        for (int i = 0; i < nelem; ++i) {
+            if (i < 10)
+                printf("%f ", host_mats[dev_idx][i]);
+            if (fabs(expected[i] - host_mats[dev_idx][i]) > TOL) {
+                fprintf(stderr, "Mismatch at device %d, index %d: expected %f, got %f\n", dev_idx, i, expected[i], host_mats[dev_idx][i]);
+                exit(1);
+            }
+        }
+        printf("... (%d elements)\n", nelem);
+    }
+
+    /*
+        Cleanup and exit
+    */
+
+    // Free resources
+    benchmark("Cleanup", [&size, &mcPtrs, &memPtrs, &mcHandle, &memHandles] {
+        for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+            CUDACHECK(cudaSetDevice(dev_idx));
+    
+            // Always free the memory in this order
+            CUCHECK(cuMemUnmap(mcPtrs[dev_idx], size));
+            CUCHECK(cuMemUnmap(memPtrs[dev_idx], size));
+            CUCHECK(cuMemAddressFree(mcPtrs[dev_idx], size));
+            CUCHECK(cuMemAddressFree(memPtrs[dev_idx], size));
+            CUCHECK(cuMemRelease(memHandles[dev_idx]));
+        }
+    });
+
+    for (int dev_idx = 0; dev_idx < NUM_DEVICES; ++dev_idx) {
+        free(host_mats[dev_idx]);
+    }
+
+    free(host_mats);
+    free(expected);
+
+    printf("Done\n");
+    return 0;
+}
+
+__global__ void all_reduce_float32_sum(float *data, int nelem) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx * 4 < nelem) {
+        volatile float4 val;
+        float *ptr = data + idx * 4;
+        asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w) : "l"(ptr) : "memory"); // relaxed vs weak?
+        asm volatile("fence.proxy.alias;" ::: "memory"); // force memory ordering
+        // *ptr = val;
+        asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w) : "memory"); // curious: what if I don't use asm here and just use plain assignment?
+        /*
+            Very interesting finding: using plain assignment seems to result in lazy loading (very difffernt times measured), while asm st does not
+                                      maybe because I can force memory consistency with multimem.st.
+                                      So maybe we SHOULD use multimem.st for all stores
+                                    Never mind. This doesn't seem to be true. The times just change crazily with chrono measuring.
+                                    I think timing is based on what workloads are currently running on the GPUs
+        */
+    }
+}
+
+__global__ void stupid_load_store(float *dst, float *src, int nelem) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < nelem) {
+        dst[idx] = src[idx];
+    }
+}
