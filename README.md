@@ -1,6 +1,9 @@
 # GPU Experiments
 
-Requirements:
+A collection of tests and benchmarks for my own research.
+
+## Requirements
+
 - Thunderkittens
 - NCU in $HOME/ncu
 - CUDA in /usr/local/cuda-12
