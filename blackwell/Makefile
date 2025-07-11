@@ -1,5 +1,5 @@
 # Source files
-SRC := ??
+SRC := 00-sanity-check.cu
 
 # Compiler configuration
 NVCC := nvcc
@@ -14,7 +14,7 @@ THUNDERKITTENS_ROOT := ../ThunderKittens
 # PYTHON_LIBDIR := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
 # PYTORCH_LIBDIR := $(shell python3 -c "from torch.utils.cpp_extension import library_paths; print(' '.join(['-L' + p for p in library_paths()]))")
 # EXT_SUFFIX := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-SO_FLAGS := -shared -fPIC
+# SO_FLAGS := -shared -fPIC
 
 # GPU configuration
 GPU := B200
@@ -27,12 +27,12 @@ NVCCFLAGS += --use_fast_math -O3 # Note that --use_fast_math will harm precision
 NVCCFLAGS += -forward-unknown-to-host-compiler 
 NVCCFLAGS += -std=c++20 -x cu -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static -lcublas
 NVCCFLAGS += -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills 
-NVCCFLAGS += $(SO_FLAGS)
 
 # ThunderKittens includes
 # NVCCFLAGS += -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype
 
 # NVCC flags for PyTorch binding
+# NVCCFLAGS += $(SO_FLAGS)
 # NVCCFLAGS += -ltorch -lc10_cuda -ltorch_cuda
 # NVCCFLAGS += $(PYBIND_INCLUDES) -L${PYTHON_LIBDIR} -lpython${PYTHON_VERSION}
 # NVCCFLAGS += $(PYTORCH_INCLUDES) ${PYTORCH_LIBDIR}
@@ -48,16 +48,16 @@ else
 endif
 
 # Output target
-OUT := $(basename $(SRC))
+OUT := $(basename $(SRC)).out
 # OUT := $(basename $(SRC))$(EXT_SUFFIX)
 
-all:
-	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(OUT)
+all: $(OUT)
 
-run: all
+run: $(OUT)
 	./$(OUT)
+
+$(OUT): $(SRC)
+	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(OUT)
 
 clean:
 	rm -f $(OUT)
-
-.PHONY: all clean
