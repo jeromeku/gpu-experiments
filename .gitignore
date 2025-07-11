@@ -10,3 +10,4 @@ uftrace.data.old/
 gmon.out
 .vscode/
 .DS_Store
+*.out
