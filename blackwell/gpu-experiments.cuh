@@ -8,14 +8,17 @@
 #include <assert.h>
 
 // C++
+#include <chrono>
 #include <iostream>
 #include <memory>
-#include <chrono>
+#include <random>
+#include <omp.h>
 
 // CUDA
 #include "cuda.h"
 #include "cuda_runtime.h"
 #include "cuda_profiler_api.h"
+#include "cuda_fp8.h"
 
 // CUDA driver API
 #define CUCHECK(cmd) do {                                     \
