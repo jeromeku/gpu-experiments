@@ -28,6 +28,8 @@ constexpr int N = 128;
 constexpr int M = 128;
 constexpr int K = 32;
 constexpr int Q_BLOCK = 32;
+constexpr int NUM_BLOCKS = K / Q_BLOCK;
+constexpr float DEST_MAX = 448.0;
 
 constexpr int SM_COUNT = 148;
 constexpr int WARP_THREADS = 32;
@@ -85,11 +87,11 @@ int main() {
 
     // Allocate host memory
     float *h_A = new float[M * K];
-    float *h_B = new float[K * N];
+    float *h_B = new float[N * K];
     __nv_fp8_e4m3 *h_A_fp8 = new __nv_fp8_e4m3[M * K];
-    __nv_fp8_e4m3 *h_B_fp8 = new __nv_fp8_e4m3[K * N];
-    __nv_fp8_e8m0 *h_A_sc = new __nv_fp8_e8m0[M * K / Q_BLOCK];
-    __nv_fp8_e8m0 *h_B_sc = new __nv_fp8_e8m0[K / Q_BLOCK * N];
+    __nv_fp8_e4m3 *h_B_fp8 = new __nv_fp8_e4m3[N * K];
+    __nv_fp8_e8m0 *h_A_sc = new __nv_fp8_e8m0[M * NUM_BLOCKS];
+    __nv_fp8_e8m0 *h_B_sc = new __nv_fp8_e8m0[N * NUM_BLOCKS];
     float *h_C = new float[M * N];
     float *h_C_ref = new float[M * N];
     std::cout << "Allocated host memory" << std::endl;
@@ -97,12 +99,80 @@ int main() {
     // Initialize random number generator
     std::random_device rd;
     std::mt19937 gen(42);
-    std::uniform_real_distribution<> dis(-0.5, 0.5);
+    std::normal_distribution<float> dis(0.0, 1.0);
 
     // Initialize matrices with random values
     for (int i = 0; i < M * K; ++i) h_A[i] = dis(gen);
-    for (int i = 0; i < K * N; ++i) h_B[i] = dis(gen);
+    for (int i = 0; i < N * K; ++i) h_B[i] = dis(gen);
     std::cout << "Initialized matrices" << std::endl;
+
+    // Matrix A quantization
+    for (int i = 0; i < M; i++) {
+        for (int block = 0; block < NUM_BLOCKS; block++) {
+            // Get block absolute maximum
+            float amax = fabsf(h_A[i * K + block * Q_BLOCK]);
+            for (int j = 1; j < Q_BLOCK; j++)
+                amax = fmaxf(amax, h_A[i * K + block * Q_BLOCK + j]);
+
+            // ceilf(log2f(amax / DEST_MAX)) with round to +inf & clamp to [2^-127, 2^127]
+            h_A_sc[i * NUM_BLOCKS + block] = __nv_fp8_e8m0(amax / DEST_MAX); 
+            // printf("actual: %f, stored: %d, val: %f\n", amax / DEST_MAX, 
+            //     *reinterpret_cast<uint8_t *>(&h_A_sc[i * NUM_BLOCKS + block]) - 127,
+            //     powf(2., *reinterpret_cast<uint8_t *>(&h_A_sc[i * NUM_BLOCKS + block]) - 127));
+
+            // Quantize
+            for (int j = 0; j < Q_BLOCK; j++) {
+                float quantized_fp32 = h_A[i * K + block * Q_BLOCK + j] / 
+                    powf(2., *reinterpret_cast<uint8_t *>(&h_A_sc[i * NUM_BLOCKS + block]) - 127);
+                h_A_fp8[i * K + block * Q_BLOCK + j] = __nv_fp8_e4m3(quantized_fp32);
+            }
+        }
+    }
+
+    // Matrix B quantization
+    for (int i = 0; i < N; i++) {
+        for (int block = 0; block < NUM_BLOCKS; block++) {
+            // Get block absolute maximum
+            float amax = fabsf(h_B[i * K + block * Q_BLOCK]);
+            for (int j = 1; j < Q_BLOCK; j++)
+                amax = fmaxf(amax, h_B[i * K + block * Q_BLOCK + j]);
+
+            // this does ceilf(log2f(amax / DEST_MAX)) with round to +inf & clamp to [2^-127, 2^127]
+            h_B_sc[i * NUM_BLOCKS + block] = __nv_fp8_e8m0(amax / DEST_MAX); 
+            // printf("actual: %f, stored: %d, val: %f\n", amax / DEST_MAX, 
+            //     *reinterpret_cast<uint8_t *>(&h_B_sc[i * NUM_BLOCKS + block]) - 127,
+            //     powf(2., *reinterpret_cast<uint8_t *>(&h_B_sc[i * NUM_BLOCKS + block]) - 127));
+
+            // Quantize
+            for (int j = 0; j < Q_BLOCK; j++) {
+                float quantized_fp32 = h_B[i * K + block * Q_BLOCK + j] / 
+                    powf(2., *reinterpret_cast<uint8_t *>(&h_B_sc[i * NUM_BLOCKS + block]) - 127);
+                h_B_fp8[i * K + block * Q_BLOCK + j] = __nv_fp8_e4m3(quantized_fp32);
+            }
+        }
+    }
+
+    // Sanity check: dequantize and check errors
+    // for (int i = 0; i < M; i++) {
+    //     for (int block = 0; block < NUM_BLOCKS; block++) {
+    //         for (int j = 0; j < Q_BLOCK; j++) {
+    //             float dequantized_fp32 = float(h_A_fp8[i * K + block * Q_BLOCK + j]) * 
+    //                 powf(2., *reinterpret_cast<uint8_t *>(&h_A_sc[i * NUM_BLOCKS + block]) - 127);
+    //             float error = fabsf(h_A[i * K + block * Q_BLOCK + j] - dequantized_fp32);
+    //             printf("A: %f, dequantized: %f, error: %f\n", h_A[i * K + block * Q_BLOCK + j], dequantized_fp32, error);
+    //         }
+    //     }
+    // }
+    // for (int i = 0; i < N; i++) {
+    //     for (int block = 0; block < NUM_BLOCKS; block++) {
+    //         for (int j = 0; j < Q_BLOCK; j++) {
+    //             float dequantized_fp32 = float(h_B_fp8[i * K + block * Q_BLOCK + j]) * 
+    //                 powf(2., *reinterpret_cast<uint8_t *>(&h_B_sc[i * NUM_BLOCKS + block]) - 127);
+    //             float error = fabsf(h_B[i * K + block * Q_BLOCK + j] - dequantized_fp32);
+    //             printf("B: %f, dequantized: %f, error: %f\n", h_B[i * K + block * Q_BLOCK + j], dequantized_fp32, error);
+    //         }
+    //     }
+    // }
 
     // Run reference GEMM
     cpu_gemm(h_A, h_B, h_C_ref, M, N, K);
@@ -120,6 +190,14 @@ int main() {
     CUDACHECK(cudaMalloc(&d_B_sc, K / Q_BLOCK * N * sizeof(__nv_fp8_e8m0)));
     CUDACHECK(cudaMalloc(&d_C, M * N * sizeof(float)));
     std::cout << "Allocated device memory" << std::endl;
+
+    // Copy data to device
+    CUDACHECK(cudaMemcpy(d_A_fp8, h_A_fp8, M * K * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(d_B_fp8, h_B_fp8, N * K * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(d_A_sc, h_A_sc, M * NUM_BLOCKS * sizeof(__nv_fp8_e8m0), cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(d_B_sc, h_B_sc, N * NUM_BLOCKS * sizeof(__nv_fp8_e8m0), cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemset(d_C, 999999999.0f, M * N * sizeof(float))); // useful for checking errors
+    std::cout << "Copied data to device" << std::endl;
 
     // Launch kernel
     std::cout << "Launching kernel..." << std::endl;
