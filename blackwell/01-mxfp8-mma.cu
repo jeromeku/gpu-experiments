@@ -48,6 +48,7 @@ constexpr int NUM_WARPGROUPS = 2;
 constexpr int NUM_THREADS = WARPGROUP_THREADS * NUM_WARPGROUPS;
 constexpr int MAX_SHARED_MEMORY = 227000; // Hopper/Blackwell
 constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1000;
+constexpr int PIPELINE_STAGES = 4;
 
 
 __global__ void kernel(
@@ -57,51 +58,70 @@ __global__ void kernel(
     const __grid_constant__ __nv_fp8_e4m3 * const B_fp8,
     const __grid_constant__ __nv_fp8_e8m0 * const B_sc,
     const __grid_constant__ CUtensorMap B_tmap,
-    const __grid_constant__ float * const C
+    const float *C
 ) { 
     // Retrieve thread info
     int lane_id = threadIdx.x % WARP_THREADS;
-    int warp_id = threadIdx.x / WARP_THREADS;
+    int warp_id = (threadIdx.x / WARP_THREADS) % WARPGROUP_WARPS;
     int warpgroup_id = threadIdx.x / WARPGROUP_THREADS;
 
     // Allocate shared memory
     extern __shared__ int __shm[];
-    __shared__ uint64_t mbarrier;
+    __shared__ uint64_t inputs_arrived[PIPELINE_STAGES];
+    __shared__ uint64_t inputs_finished[PIPELINE_STAGES];
+    __shared__ uint64_t tm_finished[PIPELINE_STAGES];
+    __shared__ uint64_t matmul_finished[PIPELINE_STAGES];
     __shared__ uint32_t tm_addr_shared;
 
     // Assign shared tiles. TMA swizzle require 1024 alignment max
-    uint64_t __shm_ptr = reinterpret_cast<uint64_t>(&__shm[0]);
+    uint64_t __shm_base = reinterpret_cast<uint64_t>(&__shm[0]);
+    uint64_t __shm_ptr = __shm_base;
     __nv_fp8_e4m3 *A_fp8_shm = reinterpret_cast<__nv_fp8_e4m3 *>(((__shm_ptr + 1023) / 1024) * 1024);
-    __shm_ptr += sizeof(__nv_fp8_e4m3) * TILE_M * TILE_K;
+    __shm_ptr = reinterpret_cast<uint64_t>(A_fp8_shm) + sizeof(__nv_fp8_e4m3) * TILE_M * TILE_K;
     __nv_fp8_e8m0 *A_sc_shm = reinterpret_cast<__nv_fp8_e8m0 *>(((__shm_ptr + 1023) / 1024) * 1024);
-    __shm_ptr += sizeof(__nv_fp8_e8m0) * TILE_M * NUM_BLOCKS;
+    __shm_ptr = reinterpret_cast<uint64_t>(A_sc_shm) + sizeof(__nv_fp8_e8m0) * TILE_M * NUM_BLOCKS;
     __nv_fp8_e4m3 *B_fp8_shm = reinterpret_cast<__nv_fp8_e4m3 *>(((__shm_ptr + 1023) / 1024) * 1024);
-    __shm_ptr += sizeof(__nv_fp8_e4m3) * TILE_N * TILE_K;
+    __shm_ptr = reinterpret_cast<uint64_t>(B_fp8_shm) + sizeof(__nv_fp8_e4m3) * TILE_N * TILE_K;
     __nv_fp8_e8m0 *B_sc_shm = reinterpret_cast<__nv_fp8_e8m0 *>(((__shm_ptr + 1023) / 1024) * 1024);
-    __shm_ptr += sizeof(__nv_fp8_e8m0) * TILE_N * NUM_BLOCKS;
+    __shm_ptr = reinterpret_cast<uint64_t>(B_sc_shm) + sizeof(__nv_fp8_e8m0) * TILE_N * NUM_BLOCKS;
     float *C_shm = reinterpret_cast<float *>(((__shm_ptr + 1023) / 1024) * 1024);
-    __shm_ptr += sizeof(float) * TILE_M * TILE_N;
-    if (__shm_ptr >= DYNAMIC_SHARED_MEMORY) {
-        if (threadIdx.x == 0) printf("ERROR: Exceeded maximum dynamic shared memory.");
-        asm volatile("trap;");
+    __shm_ptr = reinterpret_cast<uint64_t>(C_shm) + sizeof(float) * TILE_M * TILE_N;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        printf("Dynamic memory allocated: %ld B\n", __shm_ptr - __shm_base);
+        if (__shm_ptr - __shm_base >= DYNAMIC_SHARED_MEMORY) {
+            printf("ERROR: Exceeded maximum dynamic shared memory\n");
+            asm volatile("trap;");
+        }
     }
+
+    // Convert generic shared memory addresses to shared state
+    uint32_t A_fp8_shm_addr = static_cast<uint32_t>(__cvta_generic_to_shared(A_fp8_shm));
+    uint32_t A_sc_shm_addr = static_cast<uint32_t>(__cvta_generic_to_shared(A_sc_shm));
+    uint32_t B_fp8_shm_addr = static_cast<uint32_t>(__cvta_generic_to_shared(B_fp8_shm));
+    uint32_t B_sc_shm_addr = static_cast<uint32_t>(__cvta_generic_to_shared(B_sc_shm));
+    uint32_t C_shm_addr = static_cast<uint32_t>(__cvta_generic_to_shared(C_shm));
 
     // Initialize mbarriers
     if (threadIdx.x == 0) {
-        asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-            :
-            : "l"(__cvta_generic_to_shared(&mbarrier)), "r"(1)
-        );
+        for (int i = 0; i < PIPELINE_STAGES; i++) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                ::"l"(__cvta_generic_to_shared(&inputs_arrived[i])), "r"(1));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                ::"l"(__cvta_generic_to_shared(&inputs_finished[i])), "r"(1));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                ::"l"(__cvta_generic_to_shared(&tm_finished[i])), "r"(1));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                ::"l"(__cvta_generic_to_shared(&matmul_finished[i])), "r"(1));
+        }
     }
     __syncthreads();
 
     // Allocate Tensor Memory (TM) for 1-CTA group 
     uint32_t tm_addr = 0;
     uint32_t n_cols = 32; // must be unsigned 32b
-    if (warp_id == 0) { // must be performed by a single warp in the CTA
+    if (warpgroup_id == 0 && warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.b32 [%0], %1;"
-            :
-            : "l"((uint64_t)&tm_addr_shared), "r"(n_cols)
+            :: "l"((uint64_t)&tm_addr_shared), "r"(n_cols)
         ); // __syncwarp() naturally happens here
         // After relinquish_alloc_permit, it becomes illegal for this CTA to call tcgen05.alloc
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -112,15 +132,131 @@ __global__ void kernel(
     // Main work begins here
     if (warpgroup_id == 1) {
         // Producer warpgroup
+        if (warp_id == 0 && lane_id == 0) {
+            // Input loaders
+            uint32_t bytes_expected = sizeof(__nv_fp8_e4m3) * 
+                (TILE_M * TILE_K + TILE_N * TILE_K);
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                :: "l"(__cvta_generic_to_shared(&inputs_arrived[0])), "r"(bytes_expected)
+            );
+            asm volatile("cp.async.bulk.tensor.5d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 "
+                        "[%0], [%1, {%3, %4, %5, %6, %7}], [%2];"
+                :: "r"(A_fp8_shm_addr), "l"(&A_tmap), "l"(__cvta_generic_to_shared(&inputs_arrived[0])),
+                "n"(0), "n"(0), "n"(0), "n"(0), "n"(0)
+                : "memory"
+            );
+            asm volatile("cp.async.bulk.tensor.5d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 "
+                        "[%0], [%1, {%3, %4, %5, %6, %7}], [%2];"
+                :: "r"(B_fp8_shm_addr), "l"(&B_tmap), "l"(__cvta_generic_to_shared(&inputs_arrived[0])),
+                "n"(0), "n"(0), "n"(0), "n"(0), "n"(0)
+                : "memory"
+            );
+        } else if (warp_id == 1 && lane_id == 0) {
+            // TC launchers
+            constexpr uint32_t i_desc =
+                (0b000 << 0)     | // dense matrix multiply
+                (0b0 << 3)       | // no integer saturation needed
+                (0b01 << 4)      | // FP32 accumulation
+                (0b0 << 6)       | // SBZ
+                (0b000 << 7)     | // Matrix A is E4M3
+                (0b000 << 10)    | // Matrix B is E4M3
+                (0b0 << 13)      | // Do not negate A
+                (0b0 << 14)      | // Do not negate B
+                (0b0 << 15)      | // Do not transpose A
+                (0b1 << 16)      | // Transpose B
+                ((N >> 3) << 17) | // N, encoded
+                (0b0 << 23)      | // SBZ
+                ((M >> 4) << 24) | // M, encoded
+                (0b0 << 29)      | // SBZ
+                (0b00 << 30);      // No shift in B
+            uint64_t a_desc = 
+                (((A_fp8_shm_addr & 0x3'FFFF) >> 4) << 0) | // matrix start address, encoded
+                (0b00L << 14)                             | // SBZ
+                (0x0L << 16)                              | // leading dimension stride (not used for non-transposed)
+                (0b00L << 30)                             | // SBZ
+                (((256L & 0x3'FFFF) >> 4) << 32)          | // stride dimension offset (32B swizzle x 8)
+                (0b001L << 46)                            | // fixed constant
+                (0b000L << 49)                            | // base offset is 0 since aligned
+                (0b0L << 52)                              | // leading dimension stride mode is relative
+                (0b0000'0000L << 53)                      | // SBZ
+                (0x6L << 61);                               // 32B swizzling mode
+            uint64_t b_desc = 
+                (((B_fp8_shm_addr & 0x3'FFFF) >> 4) << 0) | // matrix start address, encoded
+                (0b00L << 14)                             | // SBZ
+                ((((512L * N/16) & 0x3'FFFF) >> 4) << 16) | // leading dimension stride
+                (0b00L << 30)                             | // SBZ
+                (((256L & 0x3'FFFF) >> 4) << 32)          | // stride dimension offset (32B swizzle x 8)
+                (0b001L << 46)                            | // fixed constant
+                (0b000L << 49)                            | // base offset is 0 since aligned
+                (0b0L << 52)                              | // leading dimension stride mode is relative
+                (0b0000'0000L << 53)                      | // SBZ
+                (0x6L << 61);                               // 32B swizzling mode
+
+            uint32_t phasebit = 0;
+            asm volatile(
+                "{.reg .pred P1;                                            \t\n"
+                "BAR_WAIT:                                                  \t\n"
+                "    mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1; \t\n"
+                "    @P1 bra.uni DONE;                                      \t\n"
+                "    bra.uni BAR_WAIT;                                      \t\n"
+                "DONE:                                                      \t\n}"
+                :: "l"(__cvta_generic_to_shared(&inputs_arrived[0])), "r"(phasebit)
+            );
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); // sync
+            asm volatile(
+                "{.reg .pred P1;                                              \t\n"
+                "setp.eq.u32 P1, 1, %4;                                       \t\n"
+                "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, P1;  \t\n}"
+                :: "r"(tm_addr), "l"(a_desc), "l"(b_desc), "r"(i_desc), "n"(/*acc=*/0)
+            );
+            asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
+                :: "l"(__cvta_generic_to_shared(&matmul_finished[0]))
+            );
+        }
     } else {
         // Consumer warpgroup
+        uint32_t phasebit = 0;
+        asm volatile(
+            "{.reg .pred P1;                                            \t\n"
+            "BAR_WAIT:                                                  \t\n"
+            "    mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1; \t\n"
+            "    @P1 bra.uni DONE;                                      \t\n"
+            "    bra.uni BAR_WAIT;                                      \t\n"
+            "DONE:                                                      \t\n}"
+            :: "l"(__cvta_generic_to_shared(&matmul_finished[0])), "r"(phasebit)
+        );
+
+        // Load the result from TM to registers
+        float tmp[32];
+        asm volatile("tcgen05.ld.sync.aligned.16x256b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+            : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+              "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7]),
+              "=f"(tmp[8]), "=f"(tmp[9]), "=f"(tmp[10]), "=f"(tmp[11]),
+              "=f"(tmp[12]), "=f"(tmp[13]), "=f"(tmp[14]), "=f"(tmp[15]),
+              "=f"(tmp[16]), "=f"(tmp[17]), "=f"(tmp[18]), "=f"(tmp[19]),
+              "=f"(tmp[20]), "=f"(tmp[21]), "=f"(tmp[22]), "=f"(tmp[23]),
+              "=f"(tmp[24]), "=f"(tmp[25]), "=f"(tmp[26]), "=f"(tmp[27]),
+              "=f"(tmp[28]), "=f"(tmp[29]), "=f"(tmp[30]), "=f"(tmp[31])
+            : "r"(tm_addr + (0 << 16) + (0))
+        );
+        asm volatile("tcgen05.wait::ld.sync.aligned;");
+
+        // Signal that tensor memory is done
+        asm volatile(
+            "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+            :: "l"(__cvta_generic_to_shared(&tm_finished[0]))
+            : "memory"
+        );
+
+        // Move results to shared memory
+
+        // Store to global memory
     }
 
     // De-allocate TM for 1-CTA group
-    if (warp_id == 0) { // must be performed by a single warp in the CTA
+    if (warpgroup_id == 0 && warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-            :
-            : "r"(tm_addr), "r"(n_cols)
+            :: "r"(tm_addr), "r"(n_cols)
         );
     }
 }
