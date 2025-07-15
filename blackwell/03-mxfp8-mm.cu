@@ -32,15 +32,15 @@ struct globals {
     static constexpr int REDUCTION_BLOCK = 128;
 
     using A_fp8_tile = st_fp8e4m3<ROW_BLOCK, REDUCTION_BLOCK>;
-    using A_sc_tile = st<char, ROW_BLOCK, REDUCTION_BLOCK>; // TK does not support fp8e8m0
+    using A_sc_vec = sv<fp8e8m0, ROW_BLOCK>;
     using B_fp8_tile = st_fp8e4m3<COL_BLOCK, REDUCTION_BLOCK>;
-    using B_sc_tile = st<char, COL_BLOCK, REDUCTION_BLOCK>; // TK does not support fp8e8m0
+    using B_sc_vec = sv<fp8e8m0, COL_BLOCK>;
     using C_tile = st_fl<ROW_BLOCK, COL_BLOCK>;
 
     gl<fp8e4m3, 1, 1, -1, -1, A_fp8_tile> A_fp8;
-    gl<char, 1, 1, -1, -1, A_sc_tile> A_sc; // TK does not support fp8e8m0
+    gl<fp8e8m0, 1, 1, -1, -1, A_sc_vec> A_sc;
     gl<fp8e4m3, 1, 1, -1, -1, B_fp8_tile> B_fp8;
-    gl<char, 1, 1, -1, -1, B_sc_tile> B_sc; // TK does not support fp8e8m0
+    gl<fp8e8m0, 1, 1, -1, -1, B_sc_vec> B_sc;
     gl<float, 1, 1, -1, -1, C_tile> C;
 
     __host__ inline dim3 grid() { return dim3(1); } // use single block
@@ -49,9 +49,9 @@ struct globals {
 
     struct pipeline_inputs {
         A_fp8_tile A_fp8;
-        A_sc_tile A_sc;
+        A_sc_vec A_sc;
         B_fp8_tile B_fp8;
-        B_sc_tile B_sc;
+        B_sc_vec B_sc;
     };
 
     struct pipeline_outputs {
@@ -87,6 +87,7 @@ void mxfp8_matmul_kernel(const __grid_constant__ globals G) {
     __shared__ semaphore outputs_arrived;
     if (threadIdx.x == 0) {
         init_semaphore(inputs_arrived, 0, 1);
+        init_semaphore(scale_arrived, 0, 1);
         init_semaphore(outputs_arrived, 0, 1);
     }
     __syncthreads();
@@ -98,12 +99,12 @@ void mxfp8_matmul_kernel(const __grid_constant__ globals G) {
 
         if (warp_id == 3 && lane_id == 0) {
             // Load input matrices to shared memory
-            tma::expect_bytes(inputs_arrived, sizeof(globals::A_fp8_tile) + sizeof(globals::A_sc_tile));
+            tma::expect_bytes(inputs_arrived, sizeof(globals::A_fp8_tile) + sizeof(globals::B_fp8_tile));
             tma::load_async(inputs.A_fp8, G.A_fp8, {0, 0}, inputs_arrived);
             tma::load_async(inputs.B_fp8, G.B_fp8, {0, 0}, inputs_arrived);
         } else if (warp_id == 2 && lane_id == 0) {
             // Load scale matrices to shared memory
-            tma::expect_bytes(scale_arrived, sizeof(globals::A_sc_tile) + sizeof(globals::B_sc_tile));
+            tma::expect_bytes(scale_arrived, sizeof(globals::A_sc_vec) + sizeof(globals::B_sc_vec));
             tma::load_async(inputs.A_sc, G.A_sc, {0, 0}, scale_arrived);
             tma::load_async(inputs.B_sc, G.B_sc, {0, 0}, scale_arrived);
         } else if (warp_id == 1 && lane_id == 0) {
