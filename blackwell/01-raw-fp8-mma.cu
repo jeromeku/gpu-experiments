@@ -242,15 +242,12 @@ __global__ void kernel(
         asm volatile("tcgen05.wait::ld.sync.aligned;");
 
         // Signal that tensor memory is done
-        asm volatile(
-            "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-            :: "l"(__cvta_generic_to_shared(&tm_finished[0]))
-            : "memory"
-        );
-
-        // Move results to shared memory
-
-        // Store to global memory
+        if (threadIdx.x == 0)
+            asm volatile(
+                "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                :: "l"(__cvta_generic_to_shared(&tm_finished[0]))
+                : "memory"
+            );
     }
 
     // De-allocate TM for 1-CTA group

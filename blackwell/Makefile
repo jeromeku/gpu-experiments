@@ -1,6 +1,6 @@
 # Source files
 # SRC := 00-sanity-check.cu
-SRC := 01-mxfp8-mma.cu
+SRC := 01-raw-fp8-mma.cu
 
 # Compiler configuration
 NVCC := nvcc
