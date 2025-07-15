@@ -1,6 +1,7 @@
 # Source files
 # SRC := 00-sanity-check.cu
-SRC := 01-raw-fp8-mma.cu
+# SRC := 01-raw-fp8-mm.cu
+SRC := 02-mxfp8-mm.cu
 
 # Compiler configuration
 NVCC := nvcc
@@ -8,36 +9,41 @@ NVCC := nvcc
 # ThunderKittens configuration
 THUNDERKITTENS_ROOT := ../ThunderKittens
 
+# Standalone configuration
+# OUT := $(basename $(SRC)).out
+
 # Python binding configuration
-# PYTHON_VERSION := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")
-# PYBIND_INCLUDES := $(shell python3 -m pybind11 --includes)
+PYTHON_VERSION := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")
+PYTHON_LIBDIR := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+PYBIND_INCLUDES := $(shell python3 -m pybind11 --includes)
+EXT_SUFFIX := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+SO_FLAGS := -shared -fPIC
+NVCCFLAGS += $(SO_FLAGS)
+NVCCFLAGS += $(PYBIND_INCLUDES) -L${PYTHON_LIBDIR} -lpython${PYTHON_VERSION}
+OUT := $(basename $(SRC))$(EXT_SUFFIX)
+
+# PyTorch binding configuration
 # PYTORCH_INCLUDES := $(shell python3 -c "from torch.utils.cpp_extension import include_paths; print(' '.join(['-I' + p for p in include_paths()]))")
-# PYTHON_LIBDIR := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
 # PYTORCH_LIBDIR := $(shell python3 -c "from torch.utils.cpp_extension import library_paths; print(' '.join(['-L' + p for p in library_paths()]))")
-# EXT_SUFFIX := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-# SO_FLAGS := -shared -fPIC
+# NVCCFLAGS += $(PYTORCH_INCLUDES) ${PYTORCH_LIBDIR}
+# NVCCFLAGS += -ltorch -lc10_cuda -ltorch_cuda
+# NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
 
 # GPU configuration
 GPU := B200
 
 # NVCC flags
-NVCCFLAGS := -DNDEBUG -lineinfo
+NVCCFLAGS += -DNDEBUG -lineinfo
 NVCCFLAGS += --expt-extended-lambda --expt-relaxed-constexpr 
 NVCCFLAGS += -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing 
 NVCCFLAGS += --use_fast_math -O3 # Note that --use_fast_math will harm precision
 NVCCFLAGS += -forward-unknown-to-host-compiler 
 NVCCFLAGS += -std=c++20 -x cu -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static -lcublas
 NVCCFLAGS += -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills 
+NVCCFLAGS += -Xcudafe "--diag_suppress=68"
 
 # ThunderKittens includes
-# NVCCFLAGS += -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype
-
-# NVCC flags for PyTorch binding
-# NVCCFLAGS += $(SO_FLAGS)
-# NVCCFLAGS += -ltorch -lc10_cuda -ltorch_cuda
-# NVCCFLAGS += $(PYBIND_INCLUDES) -L${PYTHON_LIBDIR} -lpython${PYTHON_VERSION}
-# NVCCFLAGS += $(PYTORCH_INCLUDES) ${PYTORCH_LIBDIR}
-# NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
+NVCCFLAGS += -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype
 
 # Conditional setup based on the target GPU
 ifeq ($(GPU),H100)
@@ -47,10 +53,6 @@ else ifeq ($(GPU), B200)
 else
 	$(error Unsupported GPU: $(GPU). Supported GPUs are H100 and B200)
 endif
-
-# Output target
-OUT := $(basename $(SRC)).out
-# OUT := $(basename $(SRC))$(EXT_SUFFIX)
 
 all: $(OUT)
 

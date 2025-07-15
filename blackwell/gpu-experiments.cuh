@@ -13,6 +13,7 @@
 #include <memory>
 #include <random>
 #include <omp.h>
+#include <thread>
 
 // CUDA
 #include "cuda.h"
