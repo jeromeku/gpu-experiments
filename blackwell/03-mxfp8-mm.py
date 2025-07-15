@@ -35,15 +35,15 @@ def dequantize_2d(V_fp8: torch.Tensor, V_sc: torch.Tensor) -> torch.Tensor:
     assert len(V_sc.shape) == 2
     assert V_fp8.dtype == torch.float8_e4m3fn
     assert V_sc.dtype == torch.uint8
-    assert V_fp8.shape[0] == V_sc.shape[0]
-    assert V_fp8.shape[1] == V_sc.shape[1] * 32
+    assert V_fp8.shape[0] == V_sc.shape[1]
+    assert V_fp8.shape[1] == V_sc.shape[0] * 32
 
     # Torch does not support float8_e8m0, so we need to manually convert
     fp8e8m0_bias = 127
     scale = 2 ** (V_sc.to(torch.float32) - fp8e8m0_bias)
 
     # Scales are MN-major
-    V_sc = V_sc.T
+    scale = scale.T
 
     return V_fp8.to(torch.float32) * scale.repeat_interleave(32, dim=-1)
 
@@ -72,7 +72,7 @@ A_fp8, A_sc = quantize_2d(A)
 B_fp8, B_sc = quantize_2d(B)
 
 # Run kernel
-mxfp8_matmul(A_fp8, B_fp8, C)
+mxfp8_matmul(A_fp8, A_sc, B_fp8, B_sc, C)
 torch.cuda.synchronize()
 
 # Check correctness
