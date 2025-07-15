@@ -1,7 +1,7 @@
 # Source files
 # SRC := 00-sanity-check.cu
 # SRC := 01-raw-fp8-mm.cu
-SRC := 02-mxfp8-mm.cu
+SRC := 02-fp8-mm.cu
 
 # Compiler configuration
 NVCC := nvcc
@@ -20,7 +20,7 @@ EXT_SUFFIX := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_v
 SO_FLAGS := -shared -fPIC
 NVCCFLAGS += $(SO_FLAGS)
 NVCCFLAGS += $(PYBIND_INCLUDES) -L${PYTHON_LIBDIR} -lpython${PYTHON_VERSION}
-OUT := $(basename $(SRC))$(EXT_SUFFIX)
+OUT := _C$(EXT_SUFFIX)
 
 # PyTorch binding configuration
 # PYTORCH_INCLUDES := $(shell python3 -c "from torch.utils.cpp_extension import include_paths; print(' '.join(['-I' + p for p in include_paths()]))")
