@@ -31,12 +31,16 @@ struct globals {
     static constexpr int COL_BLOCK = 128;
     static constexpr int REDUCTION_BLOCK = 128;
 
-    using A_tile = st_fp8e4m3<ROW_BLOCK, REDUCTION_BLOCK>;
-    using B_tile = st_fp8e4m3<COL_BLOCK, REDUCTION_BLOCK>;
+    using A_fp8_tile = st_fp8e4m3<ROW_BLOCK, REDUCTION_BLOCK>;
+    using A_sc_tile = st<char, ROW_BLOCK, REDUCTION_BLOCK>; // TK does not support fp8e8m0
+    using B_fp8_tile = st_fp8e4m3<COL_BLOCK, REDUCTION_BLOCK>;
+    using B_sc_tile = st<char, COL_BLOCK, REDUCTION_BLOCK>; // TK does not support fp8e8m0
     using C_tile = st_fl<ROW_BLOCK, COL_BLOCK>;
 
-    gl<fp8e4m3, 1, 1, -1, -1, A_tile> A;
-    gl<fp8e4m3, 1, 1, -1, -1, B_tile> B;
+    gl<fp8e4m3, 1, 1, -1, -1, A_fp8_tile> A_fp8;
+    gl<char, 1, 1, -1, -1, A_sc_tile> A_sc; // TK does not support fp8e8m0
+    gl<fp8e4m3, 1, 1, -1, -1, B_fp8_tile> B_fp8;
+    gl<char, 1, 1, -1, -1, B_sc_tile> B_sc; // TK does not support fp8e8m0
     gl<float, 1, 1, -1, -1, C_tile> C;
 
     __host__ inline dim3 grid() { return dim3(1); } // use single block
@@ -44,8 +48,10 @@ struct globals {
     __host__ inline int dynamic_shared_memory() { return config::DYNAMIC_SHARED_MEMORY; }
 
     struct pipeline_inputs {
-        A_tile A;
-        B_tile B;
+        A_fp8_tile A_fp8;
+        A_sc_tile A_sc;
+        B_fp8_tile B_fp8;
+        B_sc_tile B_sc;
     };
 
     struct pipeline_outputs {
@@ -77,6 +83,7 @@ void mxfp8_matmul_kernel(const __grid_constant__ globals G) {
 
     // Set up mbarriers
     __shared__ semaphore inputs_arrived;
+    __shared__ semaphore scale_arrived;
     __shared__ semaphore outputs_arrived;
     if (threadIdx.x == 0) {
         init_semaphore(inputs_arrived, 0, 1);
@@ -90,14 +97,22 @@ void mxfp8_matmul_kernel(const __grid_constant__ globals G) {
         warpgroup::decrease_registers<config::PRODUCER_REGISTERS>();
 
         if (warp_id == 3 && lane_id == 0) {
-            // Load input matrices
-            tma::expect_bytes(inputs_arrived, sizeof(globals::pipeline_inputs));
-            tma::load_async(inputs.A, G.A, {0, 0}, inputs_arrived);
-            tma::load_async(inputs.B, G.B, {0, 0}, inputs_arrived);
+            // Load input matrices to shared memory
+            tma::expect_bytes(inputs_arrived, sizeof(globals::A_fp8_tile) + sizeof(globals::A_sc_tile));
+            tma::load_async(inputs.A_fp8, G.A_fp8, {0, 0}, inputs_arrived);
+            tma::load_async(inputs.B_fp8, G.B_fp8, {0, 0}, inputs_arrived);
+        } else if (warp_id == 2 && lane_id == 0) {
+            // Load scale matrices to shared memory
+            tma::expect_bytes(scale_arrived, sizeof(globals::A_sc_tile) + sizeof(globals::B_sc_tile));
+            tma::load_async(inputs.A_sc, G.A_sc, {0, 0}, scale_arrived);
+            tma::load_async(inputs.B_sc, G.B_sc, {0, 0}, scale_arrived);
+        } else if (warp_id == 1 && lane_id == 0) {
+            // Load scale matrices to tensor memory
+            wait(scale_arrived, 0);
         } else if (warp_id == 0 && lane_id == 0) {
             // Launch tensor core matrix multiply
             wait(inputs_arrived, 0);
-            mm_ABt(tm, inputs.A, inputs.B, outputs_arrived);
+            mm_ABt(tm, inputs.A_fp8, inputs.B_fp8, outputs_arrived);
         }
     } else if (warpgroup_id == 0) {
         // Consumer group
@@ -124,8 +139,10 @@ void mxfp8_matmul_kernel(const __grid_constant__ globals G) {
 PYBIND11_MODULE(_C, m) {
     m.doc() = "";
     kittens::py::bind_kernel<mxfp8_matmul_kernel>(m, "mxfp8_matmul",
-        &globals::A,
-        &globals::B,
+        &globals::A_fp8,
+        &globals::A_sc,
+        &globals::B_fp8,
+        &globals::B_sc,
         &globals::C
     );
 }
