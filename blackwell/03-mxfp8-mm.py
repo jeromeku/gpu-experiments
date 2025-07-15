@@ -23,6 +23,9 @@ def quantize_2d(V: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     fp8e8m0_bias = 127
     V_sc = (V_sc + fp8e8m0_bias).to(torch.uint8)
 
+    # Scale loads with TMA should be MN-major
+    V_sc = V_sc.T.contiguous()
+
     return V_fp8, V_sc
 
 
@@ -38,6 +41,9 @@ def dequantize_2d(V_fp8: torch.Tensor, V_sc: torch.Tensor) -> torch.Tensor:
     # Torch does not support float8_e8m0, so we need to manually convert
     fp8e8m0_bias = 127
     scale = 2 ** (V_sc.to(torch.float32) - fp8e8m0_bias)
+
+    # Scales are MN-major
+    V_sc = V_sc.T
 
     return V_fp8.to(torch.float32) * scale.repeat_interleave(32, dim=-1)
 
