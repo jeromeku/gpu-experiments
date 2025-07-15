@@ -1,6 +1,9 @@
 import torch
 torch.random.manual_seed(42)
 
+# Import our Python bindings
+from _C import mxfp8_matmul
+
 
 # Function is naive for clarity, should not be like this in production
 def quantize_2d(V: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -47,3 +50,28 @@ V_deq = dequantize_2d(V_fp8, V_sc)
 abs_diff = torch.abs(V - V_deq)
 print('Max adiff:', abs_diff.max())
 print('Mean adiff (should be around 1e-2):', abs_diff.mean())
+
+# Matrix dimensions (should not change)
+M = 128
+K = 128
+N = 128
+
+# Generate random matrices
+A = torch.randn(M, K, dtype=torch.float32, device="cuda:0") / K ** 0.25
+B = torch.randn(N, K, dtype=torch.float32, device="cuda:0") / K ** 0.25
+C = torch.zeros(M, N, dtype=torch.float32, device="cuda:0")
+
+# Quantize matrices
+A_fp8, A_sc = quantize_2d(A)
+B_fp8, B_sc = quantize_2d(B)
+
+# Run kernel
+mxfp8_matmul(A_fp8, B_fp8, C)
+torch.cuda.synchronize()
+
+# Check correctness
+C_ref = torch.matmul(A_fp8.to(torch.float32), B_fp8.T.to(torch.float32))
+assert C_ref.dtype == C.dtype
+abs_diff = torch.abs(C_ref - C)
+print(f"Max adiff: {abs_diff.max()}")
+print(f"Mean adiff: {abs_diff.mean()}")
