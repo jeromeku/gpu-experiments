@@ -24,26 +24,81 @@ Generic notes on tcgen05 instructions
 
 */
 
+// Global dimension
 constexpr int N = 128;
 constexpr int M = 128;
 constexpr int K = 32;
+
+// Tile dimension
+constexpr int TILE_N = 128;
+constexpr int TILE_M = 128;
+constexpr int TILE_K = 32;
+
+// Quantization
 constexpr int Q_BLOCK = 32;
 constexpr int NUM_BLOCKS = K / Q_BLOCK;
 constexpr float DEST_MAX = 448.0;
 
+// Kernel
 constexpr int SM_COUNT = 148;
 constexpr int WARP_THREADS = 32;
 constexpr int WARPGROUP_WARPS = 4;
 constexpr int WARPGROUP_THREADS = WARP_THREADS * WARPGROUP_WARPS;
 constexpr int NUM_WARPGROUPS = 2;
 constexpr int NUM_THREADS = WARPGROUP_THREADS * NUM_WARPGROUPS;
+constexpr int MAX_SHARED_MEMORY = 227000; // Hopper/Blackwell
+constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1000;
 
-__global__ void kernel(float *buffer) {
-    // Allocate TM for 1-CTA group 
-    uint32_t tm_addr = 0;
+
+__global__ void kernel(
+    const __grid_constant__ __nv_fp8_e4m3 * const A_fp8,
+    const __grid_constant__ __nv_fp8_e8m0 * const A_sc,
+    const __grid_constant__ CUtensorMap A_tmap,
+    const __grid_constant__ __nv_fp8_e4m3 * const B_fp8,
+    const __grid_constant__ __nv_fp8_e8m0 * const B_sc,
+    const __grid_constant__ CUtensorMap B_tmap,
+    const __grid_constant__ float * const C
+) { 
+    // Retrieve thread info
+    int lane_id = threadIdx.x % WARP_THREADS;
+    int warp_id = threadIdx.x / WARP_THREADS;
+    int warpgroup_id = threadIdx.x / WARPGROUP_THREADS;
+
+    // Allocate shared memory
+    extern __shared__ int __shm[];
+    __shared__ uint64_t mbarrier;
     __shared__ uint32_t tm_addr_shared;
+
+    // Assign shared tiles. TMA swizzle require 1024 alignment max
+    uint64_t __shm_ptr = reinterpret_cast<uint64_t>(&__shm[0]);
+    __nv_fp8_e4m3 *A_fp8_shm = reinterpret_cast<__nv_fp8_e4m3 *>(((__shm_ptr + 1023) / 1024) * 1024);
+    __shm_ptr += sizeof(__nv_fp8_e4m3) * TILE_M * TILE_K;
+    __nv_fp8_e8m0 *A_sc_shm = reinterpret_cast<__nv_fp8_e8m0 *>(((__shm_ptr + 1023) / 1024) * 1024);
+    __shm_ptr += sizeof(__nv_fp8_e8m0) * TILE_M * NUM_BLOCKS;
+    __nv_fp8_e4m3 *B_fp8_shm = reinterpret_cast<__nv_fp8_e4m3 *>(((__shm_ptr + 1023) / 1024) * 1024);
+    __shm_ptr += sizeof(__nv_fp8_e4m3) * TILE_N * TILE_K;
+    __nv_fp8_e8m0 *B_sc_shm = reinterpret_cast<__nv_fp8_e8m0 *>(((__shm_ptr + 1023) / 1024) * 1024);
+    __shm_ptr += sizeof(__nv_fp8_e8m0) * TILE_N * NUM_BLOCKS;
+    float *C_shm = reinterpret_cast<float *>(((__shm_ptr + 1023) / 1024) * 1024);
+    __shm_ptr += sizeof(float) * TILE_M * TILE_N;
+    if (__shm_ptr >= DYNAMIC_SHARED_MEMORY) {
+        if (threadIdx.x == 0) printf("ERROR: Exceeded maximum dynamic shared memory.");
+        asm volatile("trap;");
+    }
+
+    // Initialize mbarriers
+    if (threadIdx.x == 0) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+            :
+            : "l"(__cvta_generic_to_shared(&mbarrier)), "r"(1)
+        );
+    }
+    __syncthreads();
+
+    // Allocate Tensor Memory (TM) for 1-CTA group 
+    uint32_t tm_addr = 0;
     uint32_t n_cols = 32; // must be unsigned 32b
-    if (threadIdx.x < 32) { // must be performed by a single warp in the CTA
+    if (warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.b32 [%0], %1;"
             :
             : "l"((uint64_t)&tm_addr_shared), "r"(n_cols)
@@ -52,15 +107,17 @@ __global__ void kernel(float *buffer) {
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
     __syncthreads();
-    
     tm_addr = tm_addr_shared; // Move from shared memory into register
-    if (threadIdx.x == 0) {
-        printf("Block %d TM address: %u\n", blockIdx.x, tm_addr);
+
+    // Main work begins here
+    if (warpgroup_id == 1) {
+        // Producer warpgroup
+    } else {
+        // Consumer warpgroup
     }
-    
 
     // De-allocate TM for 1-CTA group
-    if (threadIdx.x < 32) { // must be performed by a single warp in the CTA
+    if (warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
             :
             : "r"(tm_addr), "r"(n_cols)
@@ -68,18 +125,6 @@ __global__ void kernel(float *buffer) {
     }
 }
 
-void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += a[i * K + k] * b[j * N + k];
-            }
-            c[i * N + j] = sum;
-        }
-    }
-}
 
 int main() {
     static_assert(K % Q_BLOCK == 0, "K must be divisible by Q_BLOCK");
@@ -96,12 +141,10 @@ int main() {
     float *h_C_ref = new float[M * N];
     std::cout << "Allocated host memory" << std::endl;
 
-    // Initialize random number generator
+    // Initialize matrices with random values
     std::random_device rd;
     std::mt19937 gen(42);
     std::normal_distribution<float> dis(0.0, 1.0);
-
-    // Initialize matrices with random values
     for (int i = 0; i < M * K; ++i) h_A[i] = dis(gen);
     for (int i = 0; i < N * K; ++i) h_B[i] = dis(gen);
     std::cout << "Initialized matrices" << std::endl;
@@ -175,7 +218,16 @@ int main() {
     // }
 
     // Run reference GEMM
-    cpu_gemm(h_A, h_B, h_C_ref, M, N, K);
+    #pragma omp parallel for collapse(2)
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum += h_A[i * K + k] * h_B[j * N + k];
+            }
+            h_C_ref[i * N + j] = sum;
+        }
+    }
     std::cout << "Performed CPU matrix multiplication" << std::endl;
 
     // Allocate device memory
@@ -199,21 +251,111 @@ int main() {
     CUDACHECK(cudaMemset(d_C, 999999999.0f, M * N * sizeof(float))); // useful for checking errors
     std::cout << "Copied data to device" << std::endl;
 
+    // Create tensor map descriptor for matrix A
+    constexpr int tma_dim = 5; // always use all 5 dimensions
+    constexpr int swizzle_bytes = 32; // should change accordingly on TILE_K
+    constexpr int swizzle_elements = swizzle_bytes / sizeof(__nv_fp8_e4m3);
+    constexpr CUtensorMapSwizzle tma_swizzle = 
+        swizzle_bytes == 32  ? CU_TENSOR_MAP_SWIZZLE_32B  :
+        swizzle_bytes == 64  ? CU_TENSOR_MAP_SWIZZLE_64B  :
+        swizzle_bytes == 128 ? CU_TENSOR_MAP_SWIZZLE_128B : 
+                               CU_TENSOR_MAP_SWIZZLE_NONE;
+    static_assert(K % swizzle_elements == 0);
+    CUtensorMap A_tmap;
+    uint64_t A_gmem_shape [5] = {
+        (uint64_t)swizzle_elements,
+        (uint64_t)M, 
+        (uint64_t)K / swizzle_elements, 
+        1, 
+        1
+    };
+    uint64_t A_gmem_stride[4] = {
+        (uint64_t)K * sizeof(__nv_fp8_e4m3), 
+        (uint64_t)swizzle_bytes, 
+        (uint64_t)M * K * sizeof(__nv_fp8_e4m3), // never utilized
+        (uint64_t)M * K * sizeof(__nv_fp8_e4m3)  // never utilized
+    };
+    uint32_t A_smem_shape [5] = {
+        swizzle_elements, 
+        TILE_M, 
+        TILE_K / swizzle_elements, 
+        1, 
+        1
+    };
+    uint32_t A_smem_stride[5] = {1, 1, 1, 1, 1};
+    CUCHECK(cuTensorMapEncodeTiled(
+        &A_tmap,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8, // there is no FP8 TMA type
+        tma_dim,
+        (void *)d_A_fp8,
+        (uint64_t *)A_gmem_shape,
+        (uint64_t *)A_gmem_stride, 
+        (uint32_t *)A_smem_shape,
+        (uint32_t *)A_smem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, // don't need this
+        tma_swizzle,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, // don't need this
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE // don't need this
+    ));
+
+    // Create tensor map descriptor for matrix B
+    CUtensorMap B_tmap;
+    uint64_t B_gmem_shape [5] = {
+        (uint64_t)swizzle_elements,
+        (uint64_t)N, 
+        (uint64_t)K / swizzle_elements, 
+        1, 
+        1
+    };
+    uint64_t B_gmem_stride[4] = {
+        (uint64_t)K * sizeof(__nv_fp8_e4m3), 
+        (uint64_t)swizzle_bytes, 
+        (uint64_t)N * K * sizeof(__nv_fp8_e4m3), // never utilized
+        (uint64_t)N * K * sizeof(__nv_fp8_e4m3)  // never utilized
+    };
+    uint32_t B_smem_shape [5] = {
+        swizzle_elements, 
+        TILE_N, 
+        TILE_K / swizzle_elements, 
+        1, 
+        1
+    };
+    uint32_t B_smem_stride[5] = {1, 1, 1, 1, 1};
+    CUCHECK(cuTensorMapEncodeTiled(
+        &B_tmap,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8, // there is no FP8 TMA type
+        tma_dim,
+        (void *)d_B_fp8,
+        (uint64_t *)B_gmem_shape,
+        (uint64_t *)B_gmem_stride, 
+        (uint32_t *)B_smem_shape,
+        (uint32_t *)B_smem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, // don't need this
+        tma_swizzle,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, // don't need this
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE // don't need this
+    ));
+
     // Launch kernel
     std::cout << "Launching kernel..." << std::endl;
     dim3 grid(SM_COUNT, 1, 1);
     dim3 block(NUM_THREADS, 1, 1);
+    CUDACHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SHARED_MEMORY
+    ));
 
     // Warmup
     for (int i = 0; i < 5; i++) {
-        kernel<<<grid, block>>>(h_A);
+        kernel<<<grid, block, DYNAMIC_SHARED_MEMORY>>>(
+            d_A_fp8, d_A_sc, A_tmap, d_B_fp8, d_B_sc, B_tmap, d_C);
         CUDACHECK(cudaDeviceSynchronize());
     }
 
     // Benchmark
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 20; i++)
-        kernel<<<grid, block>>>(h_A);
+        kernel<<<grid, block, DYNAMIC_SHARED_MEMORY>>>(
+            d_A_fp8, d_A_sc, A_tmap, d_B_fp8, d_B_sc, B_tmap, d_C);
     cudaDeviceSynchronize(); // no CUDACHECK here
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::micro> diff = end - start;
