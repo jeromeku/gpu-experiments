@@ -80,6 +80,11 @@ def reshape_A_sc(A_sc: torch.Tensor) -> torch.Tensor:
         k_blocks // K_BLOCK,
         M_BLOCK // 4, K_BLOCK * 4
     )
+    _A_sc = _A_sc.reshape(          # (m / 128, k / 4, 512)
+        m // M_BLOCK,               # this step is TK-specific (to load with SV)
+        k_blocks // K_BLOCK,
+        M_BLOCK * K_BLOCK
+    )
 
     return _A_sc.contiguous()
 

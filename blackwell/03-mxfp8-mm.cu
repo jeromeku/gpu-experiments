@@ -30,17 +30,19 @@ struct globals {
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 128;
     static constexpr int REDUCTION_BLOCK = 128;
+    static constexpr int QUANTIZATION_BLOCK = 32;
+    static constexpr int SCALE_TILE_ROWS = 32; // 128 / 4
+    static constexpr int SCALE_TILE_COLS = 16; // 4 * 4
 
     using A_fp8_tile = st_fp8e4m3<ROW_BLOCK, REDUCTION_BLOCK>;
-    using A_sc_vec = sv<fp8e8m0, ROW_BLOCK>;
+    using A_sc_vec = sv<fp8e8m0, SCALE_TILE_ROWS * SCALE_TILE_COLS>;
     using B_fp8_tile = st_fp8e4m3<COL_BLOCK, REDUCTION_BLOCK>;
-    using B_sc_vec = sv<fp8e8m0, COL_BLOCK>;
     using C_tile = st_fl<ROW_BLOCK, COL_BLOCK>;
 
     gl<fp8e4m3, 1, 1, -1, -1, A_fp8_tile> A_fp8;
-    gl<fp8e8m0, 1, 1, -1, -1, A_sc_vec> A_sc;
+    gl<fp8e8m0, 1, -1, -1, SCALE_TILE_ROWS * SCALE_TILE_COLS, A_sc_vec> A_sc;
     gl<fp8e4m3, 1, 1, -1, -1, B_fp8_tile> B_fp8;
-    gl<fp8e8m0, 1, 1, -1, -1, B_sc_vec> B_sc;
+    gl<fp8e8m0, 1, 1, -1, -1> B_sc;
     gl<float, 1, 1, -1, -1, C_tile> C;
 
     __host__ inline dim3 grid() { return dim3(1); } // use single block
@@ -51,7 +53,6 @@ struct globals {
         A_fp8_tile A_fp8;
         A_sc_vec A_sc;
         B_fp8_tile B_fp8;
-        B_sc_vec B_sc;
     };
 
     struct pipeline_outputs {
@@ -104,9 +105,8 @@ void mxfp8_matmul_kernel(const __grid_constant__ globals G) {
             tma::load_async(inputs.B_fp8, G.B_fp8, {0, 0}, inputs_arrived);
         } else if (warp_id == 2 && lane_id == 0) {
             // Load scale matrices to shared memory
-            tma::expect_bytes(scale_arrived, sizeof(globals::A_sc_vec) + sizeof(globals::B_sc_vec));
-            tma::load_async(inputs.A_sc, G.A_sc, {0, 0}, scale_arrived);
-            tma::load_async(inputs.B_sc, G.B_sc, {0, 0}, scale_arrived);
+            tma::expect_bytes(scale_arrived, sizeof(globals::A_sc_vec));
+            tma::load_async(inputs.A_sc, G.A_sc, {0, 0, 0}, scale_arrived);
         } else if (warp_id == 1 && lane_id == 0) {
             // Load scale matrices to tensor memory
             wait(scale_arrived, 0);
