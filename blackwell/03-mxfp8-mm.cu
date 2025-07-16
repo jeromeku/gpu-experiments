@@ -110,6 +110,17 @@ void mxfp8_matmul_kernel(const __grid_constant__ globals G) {
         } else if (warp_id == 1 && lane_id == 0) {
             // Load scale matrices to tensor memory
             wait(scale_arrived, 0);
+            uint64_t a_desc = 
+                (((reinterpret_cast<uint64_t>(&inputs.A_sc) & 0x3'FFFF) >> 4) << 0) | // matrix start address, encoded
+                (0b00L << 14)                             | // SBZ
+                (0x0L << 16)                              | // leading dimension stride (not used for non-transposed)
+                (0b00L << 30)                             | // SBZ
+                (((256L & 0x3'FFFF) >> 4) << 32)          | // stride dimension offset (32B swizzle x 8)
+                (0b001L << 46)                            | // fixed constant
+                (0b000L << 49)                            | // base offset is 0 since aligned
+                (0b0L << 52)                              | // leading dimension stride mode is relative
+                (0b0000'0000L << 53)                      | // SBZ
+                (0x6L << 61);                               // 32B swizzling mode
         } else if (warp_id == 0 && lane_id == 0) {
             // Launch tensor core matrix multiply
             wait(inputs_arrived, 0);
