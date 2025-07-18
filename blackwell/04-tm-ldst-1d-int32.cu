@@ -51,8 +51,9 @@ __global__ void kernel(const __grid_constant__ globals G) {
 
     // TM load launched by threads 0, ..., 127
     int dst = 0; // to truly check if value got loaded
-    asm volatile("tcgen05.ld.sync.aligned.16x64b.x1.b32 {%1}, [%0];"
-        :: "r"(tm_addr + (threadIdx.x / 32) * 0x0020'0000), "r"(dst) // although different addr, mod 32 will make TM access per warp the same
+    asm volatile("tcgen05.ld.sync.aligned.16x64b.x1.b32 {%0}, [%1];"
+        : "=r"(dst) // although different addr, mod 32 will make TM access per warp the same
+        : "r"(tm_addr + (threadIdx.x / 32) * 0x0020'0000)
     );
     asm volatile("tcgen05.wait::st.sync.aligned;"); // waits for st issued by current thread
     asm volatile("bar.sync %0, %1;" :: "n"(0), "n"(128)); // warpgroup sync
