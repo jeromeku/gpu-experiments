@@ -3,7 +3,8 @@
 # SRC := 01-raw-fp8-mm.cu
 # SRC := 02-fp8-mm.cu
 # SRC := 03-mxfp8-mm.cu
-SRC := 04-tm-read.cu
+SRC := 04-tm-ldst-1d-int32.cu
+# SRC := 05-tm-alloc.cu
 
 # Compiler configuration
 NVCC := nvcc
@@ -13,6 +14,7 @@ THUNDERKITTENS_ROOT := ../ThunderKittens
 
 # Standalone configuration
 # OUT := $(basename $(SRC)).out
+# RUN_CMD := ./$(OUT)
 
 # Python binding configuration
 PYTHON_VERSION := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")
@@ -23,6 +25,7 @@ SO_FLAGS := -shared -fPIC
 NVCCFLAGS += $(SO_FLAGS)
 NVCCFLAGS += $(PYBIND_INCLUDES) -L${PYTHON_LIBDIR} -lpython${PYTHON_VERSION}
 OUT := _C$(EXT_SUFFIX)
+RUN_CMD := python3 $(basename $(SRC)).py
 
 # PyTorch binding configuration
 # PYTORCH_INCLUDES := $(shell python3 -c "from torch.utils.cpp_extension import include_paths; print(' '.join(['-I' + p for p in include_paths()]))")
@@ -59,7 +62,7 @@ endif
 all: $(OUT)
 
 run: $(OUT)
-	./$(OUT)
+	$(RUN_CMD)
 
 $(OUT): $(SRC)
 	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(OUT)
