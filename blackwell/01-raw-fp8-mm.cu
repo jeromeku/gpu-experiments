@@ -251,6 +251,7 @@ __global__ void kernel(
     }
 
     // De-allocate TM for 1-CTA group
+    // Without this, CUDA will raise unfreed tensor memory error
     if (warpgroup_id == 0 && warp_id == 0) { // must be performed by a single warp in the CTA
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
             :: "r"(tm_addr), "r"(n_cols)
