@@ -18,8 +18,6 @@ using namespace kittens::prototype;
 
 // Kernel globals
 struct globals {
-    // constexpr int BLOCK_SIZE = 128;
-
     gl<int, 1, 1, 1, -1> tensor;
 
     __host__ inline dim3 grid() { return dim3(1); } // use single block
