@@ -2,12 +2,13 @@
 # SRC := 00-sanity-check.cu
 # SRC := 01-raw-fp8-mm.cu
 # SRC := 02-fp8-mm.cu
-# SRC := 03-mxfp8-mm.cu
+# SRC := 03-half-raw-fp8-mm.cu
 # SRC := 04-tm-ldst-1d-int32.cu
 # SRC := 05-tm-alloc.cu
 # SRC := 06-tm-ldst-2d-int32.cu
 # SRC := 07-tm-cp.cu
-SRC := 08-tm-cp-fp8.cu
+# SRC := 08-tm-cp-fp8.cu
+SRC := 09-mxfp8-mm.cu
 
 # Compiler configuration
 NVCC := nvcc
