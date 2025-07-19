@@ -8,7 +8,9 @@
 # SRC := 06-tm-ldst-2d-int32.cu
 # SRC := 07-tm-cp.cu
 # SRC := 08-tm-cp-fp8.cu
-SRC := 09-mxfp8-mm.cu
+# SRC := 09-mxfp8-mm.cu
+# SRC := 10-mxfp8-mma.cu
+SRC := 11-fp8-mma-wg-ablation.cu
 
 # Compiler configuration
 NVCC := nvcc
