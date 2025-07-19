@@ -1,3 +1,8 @@
+/*
+    Observations:
+    - warpx4 means it will be multicasted to TM lanes 0-31, 32-63, 64-95, 96-127
+*/
+
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "pyutils/pyutils.cuh"
@@ -71,7 +76,7 @@ __global__ void kernel(const __grid_constant__ globals G) {
 
     // Perform the async copy from smem to tmem
     if (threadIdx.x == 0) {
-        asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
+        asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" // warpx4 means it will be multicasted to TM lanes 0-31, 32-63, 64-95, 96-127
             :: "r"(tm_addr), "l"(s_desc)
         );
         asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
