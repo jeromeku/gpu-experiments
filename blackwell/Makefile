@@ -10,7 +10,8 @@
 # SRC := 08-tm-cp-fp8.cu
 # SRC := 09-mxfp8-mm.cu
 # SRC := 10-mxfp8-mma.cu
-SRC := 11-fp8-mma-wg-ablation.cu
+# SRC := 11-fp8-mma-wg-ablation.cu
+SRC := 12-fp8-mma-N-ablation.cu
 
 # Compiler configuration
 NVCC := nvcc
