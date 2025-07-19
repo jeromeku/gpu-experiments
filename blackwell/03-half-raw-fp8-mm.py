@@ -2,7 +2,7 @@ import torch
 torch.random.manual_seed(42)
 
 # Import our Python bindings
-from _C import mxfp8_matmul
+from _C import kernel
 
 
 # Function is naive for clarity, should not be like this in production
@@ -50,45 +50,6 @@ def dequantize_2d(V_fp8: torch.Tensor, V_sc: torch.Tensor) -> torch.Tensor:
     return V_fp8.to(torch.float32) * scale.repeat_interleave(32, dim=-1)
 
 
-def reshape_A_sc(A_sc: torch.Tensor) -> torch.Tensor:
-    # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-1x
-    assert len(A_sc.shape) == 2
-    assert A_sc.dtype == torch.uint8
-    assert A_sc.shape[1] % 128 == 0
-    assert (A_sc.shape[0] * 32) % 128 == 0
-
-    M_BLOCK = 128
-    K_BLOCK = 4 # 128 / 32
-
-    k_blocks, m = A_sc.shape
-
-    _A_sc = A_sc                    # (k_blocks, m)
-    _A_sc = _A_sc.transpose(0, 1)   # (m, k_blocks)
-    _A_sc = _A_sc.reshape(          # (m / 128, 128, k / 4, 4)
-        m // M_BLOCK, M_BLOCK,
-        k_blocks // K_BLOCK, K_BLOCK
-    )
-    _A_sc = _A_sc.transpose(1, 2)   # (m / 128, k / 4, 128, 4) --> last 2 dims are all we need per MM
-    _A_sc = _A_sc.reshape(          # (m / 128, k / 4, 4, 32, 4)
-        m // M_BLOCK,
-        k_blocks // K_BLOCK,
-        4, M_BLOCK // 4, K_BLOCK
-    )
-    _A_sc = _A_sc.transpose(-2, -3) # (m / 128, k / 4, 32, 4, 4)
-    _A_sc = _A_sc.reshape(          # (m / 128, k / 4, 32, 16)
-        m // M_BLOCK,
-        k_blocks // K_BLOCK,
-        M_BLOCK // 4, K_BLOCK * 4
-    )
-    _A_sc = _A_sc.reshape(          # (m / 128, k / 4, 512)
-        m // M_BLOCK,               # this step is TK-specific (to load with SV)
-        k_blocks // K_BLOCK,
-        M_BLOCK * K_BLOCK
-    )
-
-    return _A_sc.contiguous()
-
-
 # Check quantization loss
 print("Checking quantization loss...")
 V = torch.randn(1024, 1024, dtype=torch.float32)
@@ -109,14 +70,11 @@ B = torch.randn(N, K, dtype=torch.float32, device="cuda:0") / K ** 0.25
 C = torch.zeros(M, N, dtype=torch.float32, device="cuda:0")
 
 # Quantize matrices
-A_fp8, _A_sc = quantize_2d(A)
+A_fp8, A_sc = quantize_2d(A)
 B_fp8, B_sc = quantize_2d(B)
 
-# Reshape scales according to tcgen05 requirements
-A_sc = reshape_A_sc(_A_sc)
-
 # Run kernel
-mxfp8_matmul(A_fp8, A_sc, B_fp8, B_sc, C)
+kernel(A_fp8, B_fp8, C)
 torch.cuda.synchronize()
 
 # Check correctness
