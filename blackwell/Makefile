@@ -5,7 +5,8 @@
 # SRC := 03-mxfp8-mm.cu
 # SRC := 04-tm-ldst-1d-int32.cu
 # SRC := 05-tm-alloc.cu
-SRC := 06-tm-ldst-2d-int32.cu
+# SRC := 06-tm-ldst-2d-int32.cu
+SRC := 07-tm-cp.cu
 
 # Compiler configuration
 NVCC := nvcc
