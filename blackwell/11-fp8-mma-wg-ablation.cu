@@ -10,7 +10,21 @@
         multiple consumer warpgroups in B200 matrix multiplies.
 
     Observations:
-        - 
+        - It is *very* slightly faster to use 1 consumer warpgroup (!)
+        - But very slight, like 5 TFLOPs gain
+            - Note that up to this point, the same number of registers were used (40/232)
+        - But this gives us a major benefit: we now have much more free registers
+            -> Now we can give FULL 256 registers to BOTH consumer and producers
+        - I think even if epilogue is expensive, it is still beneficial to have 1 consumer
+          warpgroup on B200s because:
+            - More registers == less stress trying to debug register spills
+            - CUDA core ops are synchronous anyways. Unless we are doing an async/stalling
+              operation, they are not switched
+            - Consumer warpgroups are no longer main source of TFLOPs
+        - With registers modified to give 256 to both CWG/PWG, we get another 5 TFLOPs gain!
+
+    --> Unless there is a clear benefit from using multiple consumer warpgroups, let's use a single one
+        and save registers
 */
 
 #include "kittens.cuh"
@@ -34,8 +48,9 @@ struct config {
     static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
-    static constexpr int PRODUCER_REGISTERS = 40;
-    static constexpr int CONSUMER_REGISTERS = 232;
+    // Major benefit of single consumer warpgroup: we can have more registers!
+    static constexpr int PRODUCER_REGISTERS = CONSUMER_WARPGROUPS == 1 ? 256 : 40;
+    static constexpr int CONSUMER_REGISTERS = CONSUMER_WARPGROUPS == 1 ? 256 : 232;
 
     static constexpr int PIPELINE_STAGES = 4;
 };
@@ -118,7 +133,10 @@ void kernel(const __grid_constant__ globals G) {
     // Main divergence
     if (warpgroup_id == config::NUM_WARPGROUPS - 1) {
         // Producer group
-        warpgroup::decrease_registers<config::PRODUCER_REGISTERS>();
+        if constexpr(config::CONSUMER_WARPGROUPS == 1)
+            warpgroup::increase_registers<config::PRODUCER_REGISTERS>();
+        else
+            warpgroup::decrease_registers<config::PRODUCER_REGISTERS>();
 
         // Sub divergence
         if (warp_id == 3 && lane_id == 0) {
