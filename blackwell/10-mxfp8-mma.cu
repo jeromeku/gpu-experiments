@@ -1,3 +1,9 @@
+/*
+    Pipeline depth really matters here
+    - 3 stages: 1510 TFLOPs
+    - 4 stages: 1840 TFLOPs
+*/
+
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "pyutils/pyutils.cuh"
