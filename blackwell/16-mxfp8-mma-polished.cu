@@ -14,6 +14,10 @@
         - Actually, the kernel is about 5 TFLOPs faster without such optimization(!)
             - Again, less code = easier for compiler to optimize & better i-cache reuse
         - Cleaner code and now at ** 1950 TFLOPs **
+
+    Even more observations:
+        - Using bfloat16 for C is about about 20 more TFLOPs than float32
+        - Thus minor, it only makes sense to do it for memory savings
 */
 
 #include "kittens.cuh"
@@ -328,7 +332,7 @@ void kernel(const __grid_constant__ globals G) {
                     launch_128x128_mxfp8_matmul(out_tm_addr[0], 
                                                 input_tiles[stage].A, input_tiles[stage].B, 
                                                 A_sc_tm_addr[stage], B_sc_tm_addr[stage],
-                                                i == 0 ? 1 : 0);
+                                                i == 0 ? 0 : 1);
                     commit_async_tcgen05_op(inputs_finished[stage]);
                     stage = (stage + 1) % config::PIPELINE_STAGES;
                 }
