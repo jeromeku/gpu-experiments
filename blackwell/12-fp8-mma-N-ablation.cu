@@ -13,10 +13,15 @@
         - Do one more computation with tail blocks if has_tail is true
     
     By this trick, we can do
-    - M=128m K=128k N=128n : 2550 TFLOPs
+    - M=128m K=128k N=128n : 2550 TFLOPs for N%256==0 inputs
+    - M=128m K=128k N=128n : 2548 TFLOPs for N%256!=0 inputs
 
     There's an unknown bug where we need to add __syncthreads() after 
     has_stall declaration or else the kernel becomes literally 100x slower
+
+    WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING
+    ==> This code does NOT produce correct results. But this code is abandoned 
+        because it is better to increase M rather than N (both in code simplicity and performance)
 */
 
 #include "kittens.cuh"

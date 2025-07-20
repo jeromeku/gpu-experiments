@@ -8,7 +8,7 @@ from _C import kernel
 # Matrix dimensions
 M = 16384
 K = 16384
-N = 16384
+N = 16384 + 128
 
 assert M % 128 == 0
 assert N % 128 == 0
