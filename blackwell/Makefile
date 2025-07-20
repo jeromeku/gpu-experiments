@@ -14,7 +14,8 @@
 # SRC := 12-fp8-mma-N-ablation.cu
 # SRC := 13-fp8-mma-M-ablation.cu
 # SRC := 14-fp8-mma-M-ablation-2.cu
-SRC := 15-fp8-mma-M-ablation-3.cu
+# SRC := 15-fp8-mma-M-ablation-3.cu
+SRC := 16-mxfp8-mma-polished.cu
 
 # Compiler configuration
 NVCC := nvcc
