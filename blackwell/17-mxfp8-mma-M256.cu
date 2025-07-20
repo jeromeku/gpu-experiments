@@ -1,5 +1,9 @@
 /*
-    Now we are at 2310 TFLOPs with M=128 granularity!
+    Now we are at 2300-2310 TFLOPs with M=128 granularity!
+
+    Observation:
+        - Adding branch condition to support M=128 granularity makes kernel 
+          slow to about 2260-2270 TFLOPs. But still lot better than 1950 TFLOPs!
 */
 
 #include "kittens.cuh"
@@ -241,8 +245,9 @@ void kernel(const __grid_constant__ globals G) {
     int warpgroup_id = warpgroup::groupid();
 
     // Pipeline configuration
+    int has_tail = G.C.rows() % globals::ROW_BLOCK == globals::ROW_BLOCK / 2;
     int num_blocks_per_row = G.C.cols() / globals::COL_BLOCK;
-    int num_blocks_per_col = G.C.rows() / globals::ROW_BLOCK;
+    int num_blocks_per_col = G.C.rows() / globals::ROW_BLOCK + has_tail;
     int num_blocks = num_blocks_per_row * num_blocks_per_col;
     int num_iters_per_block = G.A.cols() / globals::REDUCTION_BLOCK;
     int num_blocks_per_supergroup = globals::SUPERGROUP_BLOCKS * num_blocks_per_row;
@@ -267,9 +272,13 @@ void kernel(const __grid_constant__ globals G) {
                         arrive(outputs_arrived);
                         last_stage = -1;
                     }
-                    tma::expect_bytes(inputs_arrived[stage], sizeof(globals::A_fp8_tile) * 2 + sizeof(globals::B_fp8_tile));
+                    if (row_block_idx < num_blocks_per_col - 1 || !has_tail) {
+                        tma::expect_bytes(inputs_arrived[stage], sizeof(globals::A_fp8_tile) * 2 + sizeof(globals::B_fp8_tile));
+                        tma::load_async(input_tiles[stage].A[1], G.A, {row_block_idx * 2 + 1, i}, inputs_arrived[stage]);
+                    } else {
+                        tma::expect_bytes(inputs_arrived[stage], sizeof(globals::A_fp8_tile) + sizeof(globals::B_fp8_tile));
+                    }
                     tma::load_async(input_tiles[stage].A[0], G.A, {row_block_idx * 2 + 0, i}, inputs_arrived[stage]);
-                    tma::load_async(input_tiles[stage].A[1], G.A, {row_block_idx * 2 + 1, i}, inputs_arrived[stage]);
                     tma::load_async(input_tiles[stage].B, G.B, {col_block_idx, i}, inputs_arrived[stage]);
                     if (i == num_iters_per_block - 1) {
                         last_stage = stage;
@@ -285,9 +294,13 @@ void kernel(const __grid_constant__ globals G) {
                 for (int i = 0; i < num_iters_per_block; ++i) {
                     wait(scales_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
-                    tma::expect_bytes(scales_arrived[stage], sizeof(globals::A_sc_vec) * 2 + sizeof(globals::B_sc_vec));
+                    if (row_block_idx < num_blocks_per_col - 1 || !has_tail) {
+                        tma::expect_bytes(scales_arrived[stage], sizeof(globals::A_sc_vec) * 2 + sizeof(globals::B_sc_vec));
+                        tma::load_async(input_scales[stage].A[1], G.A_sc, {row_block_idx * 2 + 1, i, 0}, scales_arrived[stage]);
+                    } else {
+                        tma::expect_bytes(scales_arrived[stage], sizeof(globals::A_sc_vec) + sizeof(globals::B_sc_vec));
+                    }
                     tma::load_async(input_scales[stage].A[0], G.A_sc, {row_block_idx * 2 + 0, i, 0}, scales_arrived[stage]);
-                    tma::load_async(input_scales[stage].A[1], G.A_sc, {row_block_idx * 2 + 1, i, 0}, scales_arrived[stage]);
                     tma::load_async(input_scales[stage].B, G.B_sc, {col_block_idx, i, 0}, scales_arrived[stage]);
                     stage = (stage + 1) % config::PIPELINE_STAGES;
                 }
@@ -347,6 +360,8 @@ void kernel(const __grid_constant__ globals G) {
             // Store back to global memory
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
+                if (row_block_idx == num_blocks_per_col - 1 && has_tail && i >= 4)
+                    break;
                 if (consumer::warpid() == i) {
                     warp::store(output_tiles.C, C_reg);
                     __syncwarp();
