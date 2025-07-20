@@ -25,6 +25,9 @@
 
     --> Unless there is a clear benefit from using multiple consumer warpgroups, let's use a single one
         and save registers
+    
+    (Update) Never mind. Unless we need a lot of producer registers, it is obviously better to have
+             232 x 2 consumer warpgroups.
 */
 
 #include "kittens.cuh"
