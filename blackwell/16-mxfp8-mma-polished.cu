@@ -1,3 +1,21 @@
+/*
+    Just a refactor to easily expand to other functionalities. But found some interesting things
+
+    Observations:
+        - Increasing the PIPELINE_STAGES from 3 to 4 gives around 300 more TFLOPs (1510 -> 1840)
+        - Just cleaning up and encapsulating things inside a function gives 100 more TFLOPs!!
+            - Probably because it helps the compiler optimize away certain data flow, as well
+              as less code -> better i-cache reuse
+        - Now at 1945 TFLOPs
+
+    More observations:
+        - Separating the first matmul to set accumulate flag at compile time has no benefit. Just
+          makes the code less simple.
+        - Actually, the kernel is about 5 TFLOPs faster without such optimization(!)
+            - Again, less code = easier for compiler to optimize & better i-cache reuse
+        - Cleaner code and now at ** 1950 TFLOPs **
+*/
+
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "pyutils/pyutils.cuh"
@@ -121,9 +139,9 @@ __device__ static inline void commit_async_tcgen05_op(semaphore &sem) {
     asm volatile("{tcgen05.fence::before_thread_sync;}");
 }
 
-template <int accumulate, ducks::st::all A_ST, ducks::st::all B_ST>
+template <ducks::st::all A_ST, ducks::st::all B_ST>
 __device__ static inline void launch_128x128_mxfp8_matmul(
-    uint32_t out_tm_addr, A_ST &A, B_ST &B, uint32_t A_sc_tm_addr, uint32_t B_sc_tm_addr
+    uint32_t out_tm_addr, A_ST &A, B_ST &B, uint32_t A_sc_tm_addr, uint32_t B_sc_tm_addr, int accumulate
 ) {
     constexpr uint64_t M = 128;
     constexpr uint64_t N = 128;
@@ -299,25 +317,18 @@ void kernel(const __grid_constant__ globals G) {
         } else if (warp_id == 0 && lane_id == 0) {
             // Tensor core matrix multiply launcher
             WORKER_LOOP({
-                wait(tensors_finished, get_phasebit<1>(phasebits, config::PIPELINE_STAGES));
-                update_phasebit<1>(phasebits, config::PIPELINE_STAGES);
-                {
+                for (int i = 0; i < num_iters_per_block; i++) {
+                    if (i == 0) {
+                        wait(tensors_finished, get_phasebit<1>(phasebits, config::PIPELINE_STAGES));
+                        update_phasebit<1>(phasebits, config::PIPELINE_STAGES);
+                    }
                     wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
                     arrive(scales_finished[stage]);
-                    launch_128x128_mxfp8_matmul<0>(out_tm_addr[0], 
+                    launch_128x128_mxfp8_matmul(out_tm_addr[0], 
                                                 input_tiles[stage].A, input_tiles[stage].B, 
-                                    A_sc_tm_addr[stage], B_sc_tm_addr[stage]);
-                    commit_async_tcgen05_op(inputs_finished[stage]);
-                    stage = (stage + 1) % config::PIPELINE_STAGES;
-                }
-                for (int i = 1; i < num_iters_per_block; i++) {
-                    wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
-                    update_phasebit<0>(phasebits, stage);
-                    arrive(scales_finished[stage]);
-                    launch_128x128_mxfp8_matmul<1>(out_tm_addr[0], 
-                                                input_tiles[stage].A, input_tiles[stage].B, 
-                                      A_sc_tm_addr[stage], B_sc_tm_addr[stage]);
+                                                A_sc_tm_addr[stage], B_sc_tm_addr[stage],
+                                                i == 0 ? 1 : 0);
                     commit_async_tcgen05_op(inputs_finished[stage]);
                     stage = (stage + 1) % config::PIPELINE_STAGES;
                 }
