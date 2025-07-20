@@ -75,6 +75,14 @@ struct globals {
     };
 };
 
+#define PIPELINE_INIT \
+    int has_tail = G.C.rows() % globals::ROW_BLOCK == globals::ROW_BLOCK / 2; \
+    int num_blocks_per_row = G.C.cols() / globals::COL_BLOCK; \
+    int num_blocks_per_col = G.C.rows() / globals::ROW_BLOCK + has_tail; \
+    int num_blocks = num_blocks_per_row * num_blocks_per_col; \
+    int num_iters_per_block = G.A.cols() / globals::REDUCTION_BLOCK; \
+    int num_blocks_per_supergroup = globals::SUPERGROUP_BLOCKS * num_blocks_per_row;
+
 #define WORKER_LOOP(...) \
 do { \
     for (int block_idx = blockIdx.x; block_idx < num_blocks; block_idx += gridDim.x) { \
@@ -245,12 +253,7 @@ void kernel(const __grid_constant__ globals G) {
     int warpgroup_id = warpgroup::groupid();
 
     // Pipeline configuration
-    int has_tail = G.C.rows() % globals::ROW_BLOCK == globals::ROW_BLOCK / 2;
-    int num_blocks_per_row = G.C.cols() / globals::COL_BLOCK;
-    int num_blocks_per_col = G.C.rows() / globals::ROW_BLOCK + has_tail;
-    int num_blocks = num_blocks_per_row * num_blocks_per_col;
-    int num_iters_per_block = G.A.cols() / globals::REDUCTION_BLOCK;
-    int num_blocks_per_supergroup = globals::SUPERGROUP_BLOCKS * num_blocks_per_row;
+    PIPELINE_INIT
 
     // Declare stage and phasebits for semaphore waits
     int stage = 0;
