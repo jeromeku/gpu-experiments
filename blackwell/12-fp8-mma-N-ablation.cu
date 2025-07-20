@@ -11,6 +11,12 @@
         - Alias B_tile and C_tile to B_tile_tail and C_tile_tail
         - Add boolean has_tail
         - Do one more computation with tail blocks if has_tail is true
+    
+    By this trick, we can do
+    - M=128m K=128k N=128n : 2550 TFLOPs
+
+    There's an unknown bug where we need to add __syncthreads() after 
+    has_stall declaration or else the kernel becomes literally 100x slower
 */
 
 #include "kittens.cuh"
@@ -102,6 +108,7 @@ void kernel(const __grid_constant__ globals G) {
 
     // Pipeline configuration
     int has_tail = G.C.cols() % globals::COL_BLOCK == globals::COL_BLOCK_TAIL;
+    __syncthreads(); // unknown bug: without this, code is approximately 100x slower
     int num_blocks_per_row = G.C.cols() / globals::COL_BLOCK + has_tail;
     int num_blocks_per_col = G.C.rows() / globals::ROW_BLOCK;
     int num_blocks = num_blocks_per_row * num_blocks_per_col;
