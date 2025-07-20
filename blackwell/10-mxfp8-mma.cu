@@ -178,6 +178,8 @@ void kernel(const __grid_constant__ globals G) {
                 for (int i = 0; i < num_iters_per_block; i++) {
                     wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
+                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    update_phasebit<1>(phasebits, stage);
                     uint64_t A_sc_addr = reinterpret_cast<uint64_t>(__cvta_generic_to_shared(&input_scales[stage].A));
                     uint64_t A_sc_desc = 
                         (((A_sc_addr & 0x3FFFFULL) >> 4) << 0) | // bits 00-13: smem addr
