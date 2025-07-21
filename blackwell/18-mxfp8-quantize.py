@@ -4,7 +4,7 @@ torch.random.manual_seed(42)
 torch.set_printoptions(sci_mode=False)
 
 # Import our Python bindings
-from _C import kernel
+from _C import kernel, kernel_transpose
 
 
 # Function is naive for clarity, should not be like this in production
@@ -133,6 +133,22 @@ abs_diff = torch.abs(A_sc_ref.to(torch.float32) - A_sc.to(torch.float32))
 print('Max adiff (Kernel-SC):', abs_diff.max().item())
 print('Mean adiff (Kernel-SC):', abs_diff.mean().item())
 
+# Run kernel transpose
+print("Running kernel transpose...")
+A_T = A.T.contiguous()
+A_fp8.zero_()
+A_sc.zero_()
+kernel_transpose(A_T, A_fp8, A_sc)
+torch.cuda.synchronize()
+
+# Check correctness
+abs_diff = torch.abs(A_fp8_ref.to(torch.float32) - A_fp8.to(torch.float32))
+print('Max adiff (Kernel_T-FP8):', abs_diff.max().item())
+print('Mean adiff (Kernel_T-FP8):', abs_diff.mean().item())
+abs_diff = torch.abs(A_sc_ref.to(torch.float32) - A_sc.to(torch.float32))
+print('Max adiff (Kernel_T-SC):', abs_diff.max().item())
+print('Mean adiff (Kernel_T-SC):', abs_diff.mean().item())
+
 # Benchmark
 NUM_WARMUPS = 5
 NUM_ITERS = 10
@@ -141,7 +157,7 @@ start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 
 for i in range(NUM_WARMUPS):
-    kernel(A, A_fp8, A_sc)
+    kernel(A_T, A_fp8, A_sc)
 
 l2_cache_size = 1024 * 1024 * 50 # 50 MB for Hopper
 l2_cache = torch.randn(l2_cache_size // 2, dtype=torch.bfloat16)
@@ -150,7 +166,7 @@ cache_clear = lambda: l2_cache.random_(0, 1)
 for i in range(NUM_ITERS):
     cache_clear()
     start_events[i].record()
-    kernel(A, A_fp8, A_sc)
+    kernel(A_T, A_fp8, A_sc)
     end_events[i].record()
 torch.cuda.synchronize()
 

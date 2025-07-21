@@ -58,7 +58,50 @@ struct globals {
     };
 };
 
+// Load from shared memory to register tile, and transpose in the process
+template<ducks::rt::all RT, ducks::st::all ST>
+__device__ inline static void transpose_load(RT &dst, const ST &src) {
+    constexpr int GROUP_WARPS = config::CONSUMER_WARPGROUPS * WARPGROUP_WARPS;
+    constexpr int height = ST::height;
+    constexpr int warp_height = RT::height;
+    static_assert(ST::height == ST::width, "Transpose load requires square tiles.");
+    static_assert(RT::height * GROUP_WARPS == RT::width, "Transpose load requires square tiles.");
+    static_assert(std::is_same_v<typename RT::layout, ducks::rt_layout::row>, "Only row-major layout is supported.");
+    static_assert((height * config::CONSUMER_WARPGROUPS) % GROUP_WARPS == 0, "Group load / store requires tile height to be a multiple of GROUP_WARPS.");
+    static_assert(height % warp_height == 0, "Group load / store requires tile height to be a multiple of the RT height.");
+    static_assert(ST::width == RT::width, "Group load / store requires tile widths to match.");
+    static_assert(sizeof(typename ST::dtype) == 2, "Fix this function.");
+    int local_warpid;
+    if constexpr(GROUP_WARPS % 4 == 0) local_warpid = (warpid()/4+(warpid()%4)*(GROUP_WARPS/4));
+    else local_warpid = warpid();
+    using T2 = RT::dtype;
+    using U  = ST::dtype;
+    using T  = base_types::packing<T2>::unpacked_type;
+    using U2 = base_types::packing<U>::packed_type;
+    int warp_laneid = ::kittens::laneid();
+
+    // convert to shared state space
+    uint32_t shared_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&src.data[0]));
+
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            U2 tmp[4];
+            int row = j * dst.tile_size_col + (warp_laneid % 16);
+            int col = (local_warpid * warp_height + i) * dst.tile_size_row + (warp_laneid / 16) * 8;
+            move<U2>::ldsm4(tmp[0], tmp[1], tmp[2], tmp[3], src.idx(shared_addr, {row % ST::rows, col}));
+            dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(tmp[0]);
+            dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(tmp[1]);
+            dst.tiles[i][j].data[2] = base_types::convertor<T2, U2>::convert(tmp[2]);
+            dst.tiles[i][j].data[3] = base_types::convertor<T2, U2>::convert(tmp[3]);
+            warp::transpose_inplace(dst.tiles[i][j]);
+        }
+    }
+}
+
 // Kernel implementation
+template <bool transpose>
 __global__  __launch_bounds__(config::NUM_THREADS, 1)
 void kernel(const __grid_constant__ globals G) {
     // Shared memory declaration
@@ -134,8 +177,14 @@ void kernel(const __grid_constant__ globals G) {
             // Compute block indices
             int group_idx = block_idx / num_blocks_per_group;
             int group_local_block_idx = block_idx % num_blocks_per_group;
-            int row_block_idx = group_local_block_idx / num_blocks_per_row;
-            int col_block_idx = group_local_block_idx % num_blocks_per_row;
+            int row_block_idx, col_block_idx;
+            if constexpr (transpose) {
+                row_block_idx = group_local_block_idx % num_blocks_per_row;
+                col_block_idx = group_local_block_idx / num_blocks_per_row;
+            } else {
+                row_block_idx = group_local_block_idx / num_blocks_per_row;
+                col_block_idx = group_local_block_idx % num_blocks_per_row;
+            }
 
             // Wait for inputs to arrive at shared memory
             wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
@@ -143,7 +192,10 @@ void kernel(const __grid_constant__ globals G) {
 
             // Load input
             rt_bf<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE> A_bf16;
-            consumer::load(A_bf16, inputs[stage].A_bf16);
+            if constexpr (transpose)
+                transpose_load(A_bf16, inputs[stage].A_bf16);
+            else
+                consumer::load(A_bf16, inputs[stage].A_bf16);
             consumer::sync(1);
             consumer::arrive(inputs_finished[stage]);
 
@@ -215,7 +267,12 @@ void kernel(const __grid_constant__ globals G) {
 // Python bindings
 PYBIND11_MODULE(_C, m) {
     m.doc() = "";
-    kittens::py::bind_kernel<kernel>(m, "kernel",
+    kittens::py::bind_kernel<kernel<false>>(m, "kernel",
+        &globals::A_bf16,
+        &globals::A_fp8,
+        &globals::A_sc
+    );
+    kittens::py::bind_kernel<kernel<true>>(m, "kernel_transpose",
         &globals::A_bf16,
         &globals::A_fp8,
         &globals::A_sc
