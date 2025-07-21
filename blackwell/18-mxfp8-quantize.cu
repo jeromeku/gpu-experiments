@@ -25,7 +25,7 @@ struct config {
     static constexpr int PRODUCER_REGISTERS = 40;
     static constexpr int CONSUMER_REGISTERS = 232;
 
-    static constexpr int PIPELINE_STAGES = 4;
+    static constexpr int PIPELINE_STAGES = 6;
 };
 
 // Kernel globals
@@ -34,6 +34,7 @@ struct globals {
     // 2. The block should be square (for transpose)
     static constexpr int BLOCK_SIZE = 128;
     static constexpr int QUANT_BLOCK_SIZE = 32;
+    static_assert(BLOCK_SIZE / QUANT_BLOCK_SIZE == 4);
 
     using A_tile_bf16 = st_bf<BLOCK_SIZE, BLOCK_SIZE>;
     using A_tile_fp8 = st_fp8e4m3<BLOCK_SIZE, BLOCK_SIZE>;
@@ -41,7 +42,7 @@ struct globals {
 
     gl<bf16, 1, -1, -1, -1, A_tile_bf16> A_bf16;
     gl<fp8e4m3, 1, -1, -1, -1, A_tile_fp8> A_fp8;
-    gl<float, -1, -1, -1, -1, A_sc_vec> A_sc;
+    gl<fp8e8m0, -1, -1, -1, -1, A_sc_vec> A_sc;
 
     __host__ inline dim3 grid() { return dim3(config::SM_COUNT); }
     __host__ inline dim3 block() { return dim3(config::NUM_THREADS); }
@@ -71,9 +72,9 @@ void kernel(const __grid_constant__ globals G) {
     using consumer = group<config::CONSUMER_WARPGROUPS * WARPGROUP_WARPS>;
 
     // Allocate shared memory
-    static_assert(sizeof(globals::pipeline_inputs) * config::PIPELINE_STAGES + sizeof(globals::pipeline_outputs) * config::PIPELINE_STAGES <= config::DYNAMIC_SHARED_MEMORY);
+    static_assert(sizeof(globals::pipeline_inputs) * config::PIPELINE_STAGES + sizeof(globals::pipeline_outputs) <= config::DYNAMIC_SHARED_MEMORY);
     globals::pipeline_inputs (&inputs)[config::PIPELINE_STAGES] = allocator.allocate<globals::pipeline_inputs, config::PIPELINE_STAGES>();
-    globals::pipeline_outputs (&outputs)[config::PIPELINE_STAGES] = allocator.allocate<globals::pipeline_outputs, config::PIPELINE_STAGES>();
+    globals::pipeline_outputs &outputs = allocator.allocate<globals::pipeline_outputs>();
 
     // Set up mbarriers
     __shared__ semaphore inputs_arrived[config::PIPELINE_STAGES];
@@ -81,7 +82,7 @@ void kernel(const __grid_constant__ globals G) {
     if (threadIdx.x == 0) {
         for (int i = 0; i < config::PIPELINE_STAGES; ++i) {
             init_semaphore(inputs_arrived[i], 0, 1);
-            init_semaphore(inputs_finished[i], 0, 2);
+            init_semaphore(inputs_finished[i], 0, 1);
         }
     }
     __syncthreads();
@@ -142,33 +143,65 @@ void kernel(const __grid_constant__ globals G) {
 
             // Load input
             rt_bf<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE> A_bf16;
-            consumer::load(A_bf16, inputs[stage].A_bf16[warpgroup_id]);
+            consumer::load(A_bf16, inputs[stage].A_bf16);
             consumer::sync(1);
             consumer::arrive(inputs_finished[stage]);
 
             // Quantize
-            // I think I can do this by reinterpret-casting tiles into 4 array
-            rt_fl<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE> A_fl, A_fl_abs;
+            static_assert(globals::BLOCK_SIZE / 8 == 16);
+            static_assert(globals::BLOCK_SIZE / 4 == 32);
+            rt_fl<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE> A_fl_full;
+            warp::copy(A_fl_full, A_bf16);
+            auto &A_fl = *reinterpret_cast<rt_fl<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE / 4>(*)[4]>(&A_fl_full);
+            rt_fl<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE / 4> A_fl_abs[4];
+            col_vec<rt_fl<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE / 4>> scale[4]; // ortho layout
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                warp::abs(A_fl_abs[i], A_fl[i]);
+                warp::row_max(scale[i], A_fl_abs[i]);
+                warp::mul(scale[i], scale[i], 0.002232142857f); // 1 / 448
+                // Must utilize Blackwell HW for narrowing to ue8m0
+                #pragma unroll
+                for(int j = 0; j < scale[i].inner_dim; j++) {
+                    static_assert(scale[i].inner_dim == 1);
+                    fp8e8m0 tmp[2];
+                    // Rounding towards pos_inf + finite saturation (https://arxiv.org/pdf/2506.08027)
+                    // Simply put, this rounds up to the nearest 2^n
+                    asm volatile("{cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;}"
+                        : "=h"(reinterpret_cast<fp8e8m0_2 *>(&tmp[0])->__x)
+                        : "f"(scale[i][0][j].y), "f"(scale[i][0][j].x)); // careful with the order!
+                    scale[i][0][j].x = float(tmp[0]); // After narrowing, convert back for division
+                    scale[i][0][j].y = float(tmp[1]);
+                }
+                warp::div_row(A_fl[i], A_fl[i], scale[i]);
+            }
             rt_fp8e4m3<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE> A_fp8;
-            col_vec<rt_fl<globals::BLOCK_SIZE / 8, globals::BLOCK_SIZE>> scale;
-            warp::copy(A_fl, A_bf16);
-            warp::abs(A_fl_abs, A_fl);
-            warp::row_max(scale, A_fl_abs);
-            warp::max(scale, scale, 0.000000000001f); // avoid division by zero
-            warp::mul(scale, scale, 0.002232142857f); // 1 / 448
-            warp::div_row(A_fl, A_fl, scale);
-            warp::copy(A_fp8, A_fl);
+            warp::copy(A_fp8, A_fl_full);
 
             // Store results to shared memory
-            consumer::store(outputs[stage].A_fp8[warpgroup_id], A_fp8);
-            consumer::store(outputs[stage].A_sc[warpgroup_id], scale);
+            consumer::store(outputs.A_fp8, A_fp8);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int idx = (lane_id % 4) * 8 + (lane_id / 4);
+                if (idx < 16) {
+                    float src = (lane_id % 2 == 0) ? scale[i][0][0].x : scale[i][0][0].y;
+                    fp8e8m0 tmp[2];
+                    uint32_t st_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&outputs.A_sc.data[0]));
+                    asm volatile("{cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;}"
+                        : "=h"(reinterpret_cast<fp8e8m0_2 *>(&tmp[0])->__x)
+                        : "f"(src), "f"(src));
+                    // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-1x
+                    asm volatile("{st.shared.b8 [%0], %1;}" 
+                        :: "r"(st_ptr + warpgroup_id * 256 + idx * 16 + warp_id * 4 + i), 
+                           "h"(reinterpret_cast<fp8e8m0_2 *>(&tmp[0])->__x));
+                }
+            }
             consumer::sync(1);
 
             // Store results to global memory
-            // TODO: why the fuck do I have C memory per stage? we only use single stage at a time. Reduce this and increase pipeline depth
             if (consumer::laneid() == 0) {
-                tma::store_async(G.A_fp8, outputs[stage].A_fp8[warpgroup_id], {group_idx, row_block_idx, col_block_idx});
-                tma::store_async(G.A_sc, outputs[stage].A_sc[warpgroup_id], {group_idx, col_block_idx, row_block_idx}); // column-major
+                tma::store_async(G.A_fp8, outputs.A_fp8, {group_idx, row_block_idx, col_block_idx});
+                tma::store_async(G.A_sc, outputs.A_sc, {group_idx, row_block_idx, col_block_idx, 0});
                 tma::store_async_read_wait();
             }
             consumer::sync(1);

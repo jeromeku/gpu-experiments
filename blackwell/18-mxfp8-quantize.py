@@ -1,9 +1,10 @@
 import numpy as np
 import torch
 torch.random.manual_seed(42)
+torch.set_printoptions(sci_mode=False)
 
 # Import our Python bindings
-# from _C import kernel
+from _C import kernel
 
 
 # Function is naive for clarity, should not be like this in production
@@ -91,55 +92,46 @@ def reshape_sc(A_sc: torch.Tensor) -> torch.Tensor:
 
 
 # Matrix dimensions
-M = 32768
-N = 16384
+M = 204800
+N = 2048
 
-# Generate random BF16 matrix
-A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda:0") * 10.0
+# Generate random BF16 matrix from fp8 and scale matrix
+A_fp8_ref = ((torch.rand(M, N, dtype=torch.float32, device="cuda") * 2 - 1) * 448).to(torch.float8_e4m3fn)
+_A_sc_ref = torch.randint(127 - 20, 127 + 20, (N // 32, M), dtype=torch.uint8, device="cuda")
+A_sc_ref = reshape_sc(_A_sc_ref)
+A = dequantize_2d(A_fp8_ref, _A_sc_ref).to(torch.bfloat16)
+A_fp8 = torch.zeros(M, N, dtype=torch.float8_e4m3fn, device="cuda")
+A_sc = torch.zeros(M // 128, N // 128, 512, dtype=torch.uint8, device="cuda")
 
-# Reference quantization
-A_fp8_ref, _A_sc_ref = quantize_2d(A)
+# Generate PyTorch reference
+A_fp8_torch, _A_sc_torch = quantize_2d(A)
+A_sc_torch = reshape_sc(_A_sc_torch)
+abs_diff = torch.abs(A_fp8_ref.to(torch.float32) - A_fp8_torch.to(torch.float32))
+print('Max adiff (Torch-FP8):', abs_diff.max().item())
+print('Mean adiff (Torch-FP8):', abs_diff.mean().item())
+abs_diff = torch.abs(A_sc_ref.to(torch.float32) - A_sc_torch.to(torch.float32))
+print('Max adiff (Torch-SC):', abs_diff.max().item())
+print('Mean adiff (Torch-SC):', abs_diff.mean().item())
 
 # Check reference quantization loss
 print("Checking quantization loss...")
-A_deq_ref = dequantize_2d(A_fp8_ref, _A_sc_ref)
-abs_diff = torch.abs(A - A_deq_ref)
-print('Max adiff:', abs_diff.max().item())
-print('Mean adiff (should be around 2e-1):', abs_diff.mean().item())
-
-# Reshape scales according to tcgen05 requirements
-A_sc_ref = reshape_sc(_A_sc_ref)
-
-
-breakpoint()
-
-quit()
+A_torch = dequantize_2d(A_fp8_torch, _A_sc_torch).to(torch.bfloat16)
+abs_diff = torch.abs(A - A_torch)
+print('Max adiff (Torch-A):', abs_diff.max().item())
+print('Mean adiff (Torch-A):', abs_diff.mean().item())
 
 # Run kernel
 print("Running kernel...")
-kernel(A_fp8, A_sc, B_fp8, B_sc, C)
+kernel(A, A_fp8, A_sc)
 torch.cuda.synchronize()
 
-
-quit()
-
-
 # Check correctness
-C_ref = torch.matmul(A, B.T)
-assert C_ref.dtype == C.dtype
-abs_diff = torch.abs(C_ref - C)
-bias = (C - C_ref).mean().item()
-mean_ref = C_ref.mean().item()
-print(f"Max adiff: {abs_diff.max()}")
-print(f"Mean adiff: {abs_diff.mean()}")
-print("Mean diff:", bias, "Mean ref:", mean_ref)
-
-# Check correctness of dequantized matmul. This should have an exact match
-C_deq_ref = torch.matmul(A_deq, B_deq.T)
-assert C_deq_ref.dtype == C.dtype
-abs_diff = torch.abs(C_deq_ref - C)
-print('Max adiff:', abs_diff.max().item())
-print('Mean adiff (should be around 1e-6 or less):', abs_diff.mean().item())
+abs_diff = torch.abs(A_fp8_ref.to(torch.float32) - A_fp8.to(torch.float32))
+print('Max adiff (Kernel-FP8):', abs_diff.max().item())
+print('Mean adiff (Kernel-FP8):', abs_diff.mean().item())
+abs_diff = torch.abs(A_sc_ref.to(torch.float32) - A_sc.to(torch.float32))
+print('Max adiff (Kernel-SC):', abs_diff.max().item())
+print('Mean adiff (Kernel-SC):', abs_diff.mean().item())
 
 # Benchmark
 NUM_WARMUPS = 5
@@ -149,7 +141,7 @@ start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 
 for i in range(NUM_WARMUPS):
-    kernel(A_fp8, A_sc, B_fp8, B_sc, C)
+    kernel(A, A_fp8, A_sc)
 
 l2_cache_size = 1024 * 1024 * 50 # 50 MB for Hopper
 l2_cache = torch.randn(l2_cache_size // 2, dtype=torch.bfloat16)
@@ -158,15 +150,12 @@ cache_clear = lambda: l2_cache.random_(0, 1)
 for i in range(NUM_ITERS):
     cache_clear()
     start_events[i].record()
-    kernel(A_fp8, A_sc, B_fp8, B_sc, C)
+    kernel(A, A_fp8, A_sc)
     end_events[i].record()
 torch.cuda.synchronize()
 
 times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
 avg_time = np.mean(times) * 1e-3
 std_time = np.std(times) * 1e-3
-flops = 2.0 * M * N * K
-tflops = flops * 1e-12
 
 print(f"Average time: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us")
-print(f"Average TFLOPS: {tflops / (avg_time):.2f} TFLOp/s")
