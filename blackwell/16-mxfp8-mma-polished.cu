@@ -96,7 +96,7 @@ struct globals {
     int num_iters_per_block = G.A.cols() / globals::REDUCTION_BLOCK; \
     int num_blocks_per_supergroup = globals::SUPERGROUP_BLOCKS * num_blocks_per_row;
 
-#define WORKER_LOOP(...) \
+#define WORKER_OUTER_LOOP(...) \
 do { \
     for (int block_idx = blockIdx.x; block_idx < num_blocks; block_idx += gridDim.x) { \
         int supergroup_idx = block_idx / num_blocks_per_supergroup; \
@@ -106,6 +106,14 @@ do { \
         [[maybe_unused]] int row_block_idx = supergroup_idx * globals::SUPERGROUP_BLOCKS + row_within_supergroup; \
         [[maybe_unused]] int col_block_idx = idx_within_supergroup / rows_in_supergroup; \
         __VA_ARGS__ \
+    } \
+} while (0)
+
+#define WORKER_INNER_LOOP(...) \
+do { \
+    for (int i = 0; i < num_iters_per_block; i++) { \
+        __VA_ARGS__ \
+        stage = (stage + 1) % config::PIPELINE_STAGES; \
     } \
 } while (0)
 
@@ -276,8 +284,8 @@ void kernel(const __grid_constant__ globals G) {
 
         if (warp_id == 3 && lane_id == 0) {
             // Input tile loader
-            WORKER_LOOP({
-                for (int i = 0; i < num_iters_per_block; ++i) {
+            WORKER_OUTER_LOOP({
+                WORKER_INNER_LOOP({
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
                     if (stage == last_stage) {
@@ -290,27 +298,25 @@ void kernel(const __grid_constant__ globals G) {
                     if (i == num_iters_per_block - 1) {
                         last_stage = stage;
                     }
-                    stage = (stage + 1) % config::PIPELINE_STAGES;
-                }
+                });
             });
             wait(inputs_finished[last_stage], get_phasebit<1>(phasebits, last_stage));
             arrive(outputs_arrived);
         } else if (warp_id == 2 && lane_id == 0) {
             // Input scale loader
-            WORKER_LOOP({
-                for (int i = 0; i < num_iters_per_block; ++i) {
+            WORKER_OUTER_LOOP({
+                WORKER_INNER_LOOP({
                     wait(scales_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
                     tma::expect_bytes(scales_arrived[stage], sizeof(globals::A_sc_vec) + sizeof(globals::B_sc_vec));
                     tma::load_async(input_scales[stage].A, G.A_sc, {row_block_idx, i, 0}, scales_arrived[stage]);
                     tma::load_async(input_scales[stage].B, G.B_sc, {col_block_idx, i, 0}, scales_arrived[stage]);
-                    stage = (stage + 1) % config::PIPELINE_STAGES;
-                }
+                });
             });
         } else if (warp_id == 1 && lane_id == 0) {
             // Input scale tensor memory loader
-            WORKER_LOOP({
-                for (int i = 0; i < num_iters_per_block; i++) {
+            WORKER_OUTER_LOOP({
+                WORKER_INNER_LOOP({
                     wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
@@ -318,13 +324,12 @@ void kernel(const __grid_constant__ globals G) {
                     load_scales_to_tensor_memory(A_sc_tm_addr[stage], &input_scales[stage].A[0]);
                     load_scales_to_tensor_memory(B_sc_tm_addr[stage], &input_scales[stage].B[0]);
                     commit_async_tcgen05_op(inputs_arrived[stage]);
-                    stage = (stage + 1) % config::PIPELINE_STAGES;
-                }
+                });
             });
         } else if (warp_id == 0 && lane_id == 0) {
             // Tensor core matrix multiply launcher
-            WORKER_LOOP({
-                for (int i = 0; i < num_iters_per_block; i++) {
+            WORKER_OUTER_LOOP({
+                WORKER_INNER_LOOP({
                     if (i == 0) {
                         wait(tensors_finished, get_phasebit<1>(phasebits, config::PIPELINE_STAGES));
                         update_phasebit<1>(phasebits, config::PIPELINE_STAGES);
@@ -337,8 +342,7 @@ void kernel(const __grid_constant__ globals G) {
                                                 A_sc_tm_addr[stage], B_sc_tm_addr[stage],
                                                 i == 0 ? 0 : 1);
                     commit_async_tcgen05_op(inputs_finished[stage]);
-                    stage = (stage + 1) % config::PIPELINE_STAGES;
-                }
+                });
             });
         }
     } else {
@@ -346,7 +350,7 @@ void kernel(const __grid_constant__ globals G) {
         using consumer = group<config::CONSUMER_WARPGROUPS * WARPGROUP_WARPS>;
         warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
 
-        WORKER_LOOP({
+        WORKER_OUTER_LOOP({
             wait(outputs_arrived, get_phasebit<0>(phasebits, config::PIPELINE_STAGES));
             update_phasebit<0>(phasebits, config::PIPELINE_STAGES);
 
