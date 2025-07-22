@@ -150,8 +150,8 @@ print('Max adiff (Kernel_T-SC):', abs_diff.max().item())
 print('Mean adiff (Kernel_T-SC):', abs_diff.mean().item())
 
 # Benchmark
-NUM_WARMUPS = 5
-NUM_ITERS = 10
+NUM_WARMUPS = 10
+NUM_ITERS = 50
 
 start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
@@ -173,5 +173,8 @@ torch.cuda.synchronize()
 times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
 avg_time = np.mean(times) * 1e-3
 std_time = np.std(times) * 1e-3
+gb = M * N * (2 + 1 + 1 / 32) * 1e-9
+gbps = gb / avg_time
 
 print(f"Average time: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us")
+print(f"Average throughput: {gbps:.2f} GB/s")

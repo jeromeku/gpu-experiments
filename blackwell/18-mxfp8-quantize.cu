@@ -1,3 +1,12 @@
+/*
+    Obaservations:
+    - This kernel reaches about 4725 GB/s
+    - Without consumer, it reaches around 7377 GB/s. 
+        - Theoretical max is ~ 8 TB/s. So this is good. No problem with the producer
+    - Without consumer::store's from reg -> smem, it is 6979 GB/s.
+        - The culprit is mostly the shared memory writes
+*/
+
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "pyutils/pyutils.cuh"
