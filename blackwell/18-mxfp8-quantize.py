@@ -175,6 +175,8 @@ avg_time = np.mean(times) * 1e-3
 std_time = np.std(times) * 1e-3
 gb = M * N * (2 + 1 + 1 / 32) * 1e-9
 gbps = gb / avg_time
+tflop = M * N * 5 * 1e-12
 
 print(f"Average time: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us")
 print(f"Average throughput: {gbps:.2f} GB/s")
+print(f"Average TFLOPS: {tflop / avg_time:.2f} TFLOP/s")
