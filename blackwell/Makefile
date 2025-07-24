@@ -20,8 +20,9 @@
 # SRC := 18-mxfp8-quantize.cu
 # SRC := 19-smem-swizzle-8b.cu
 # SRC := 20-smem-swizzle-16b.cu
-SRC := 21-mxfp8-quantize-opt.cu
+# SRC := 21-mxfp8-quantize-opt.cu
 # SRC := 22-mxfp8-quantize-opt-2.cu
+SRC := 23-mxfp8-mma-grid-ablation.cu
 
 # Compiler configuration
 NVCC := nvcc
