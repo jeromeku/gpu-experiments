@@ -5,6 +5,17 @@
         - Theoretical max is ~ 8 TB/s. So this is good. No problem with the producer
     - Without consumer::store's from reg -> smem, it is 6979 GB/s.
         - The culprit is mostly the shared memory writes
+
+    The above observations are wrong.
+
+    Real benchmark:
+        Non-transposed:
+            - 4276.27 GB/s with consumer
+            - 5109.70 GB/s without consumer
+        Transposed:
+            - 3875 GB/s with consumer
+            - 4736 GB/s without consumer
+
 */
 
 #include "kittens.cuh"
