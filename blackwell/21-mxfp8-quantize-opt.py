@@ -92,8 +92,8 @@ def reshape_sc(A_sc: torch.Tensor) -> torch.Tensor:
 
 
 # Matrix dimensions
-M = 128
-N = 128
+M = 204800
+N = 2048
 
 # Generate random BF16 matrix from fp8 and scale matrix
 A_fp8_ref = ((torch.rand(M, N, dtype=torch.float32, device="cuda") * 2 - 1) * 448).to(torch.float8_e4m3fn)
@@ -132,8 +132,6 @@ print('Mean adiff (Kernel-FP8):', abs_diff.mean().item())
 abs_diff = torch.abs(A_sc_ref.to(torch.float32) - A_sc.to(torch.float32))
 print('Max adiff (Kernel-SC):', abs_diff.max().item())
 print('Mean adiff (Kernel-SC):', abs_diff.mean().item())
-
-breakpoint()
 
 # Benchmark
 NUM_WARMUPS = 10
