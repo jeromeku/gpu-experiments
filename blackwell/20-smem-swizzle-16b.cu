@@ -144,7 +144,7 @@ using namespace kittens;
 
 // Kernel globals
 struct globals {
-    using tile = st_bf<128, 128>;
+    using tile = st<bf16, 128, 128>;
 
     gl<bf16, 1, 1, 128, 128, tile> inputs;
     gl<bf16, 1, 1, 128, 128, tile> loaded;
@@ -179,8 +179,10 @@ __global__ void kernel(const __grid_constant__ globals G) {
     }
 
     // Replace with continous data
-    for (int i = 0; i < 128 * 128; i++) {
-        reinterpret_cast<uint16_t *>(tile.data)[i] = static_cast<uint16_t>(i);
+    for (int i = 0; i < 128; i++) {
+        for (int j = 0; j < 128; j++) {
+            reinterpret_cast<uint16_t *>(tile.data)[i * 128 + j] = static_cast<uint16_t>((i << 8) + j);
+        }
     }
 
     // Store back to global memory
