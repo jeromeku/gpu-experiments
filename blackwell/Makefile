@@ -23,6 +23,7 @@
 # SRC := 21-mxfp8-quantize-opt.cu
 # SRC := 22-mxfp8-quantize-opt-2.cu
 # SRC := 23-mxfp8-mma-grid-ablation.cu
+SRC := 24-mxfp8-quantize-grid-ablation.cu
 
 # Compiler configuration
 NVCC := nvcc
