@@ -21,6 +21,10 @@
 #include "cuda_profiler_api.h"
 #include "cuda_fp8.h"
 
+// Pybind11
+#include <pybind11/pybind11.h>
+namespace py = pybind11;
+
 // CUDA driver API
 #define CUCHECK(cmd) do {                                     \
     CUresult err = cmd;                                       \
