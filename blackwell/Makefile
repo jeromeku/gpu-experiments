@@ -40,8 +40,7 @@ PYTHON_VERSION := $(shell python3 -c "import sysconfig; print(sysconfig.get_conf
 PYTHON_LIBDIR := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
 PYBIND_INCLUDES := $(shell python3 -m pybind11 --includes)
 EXT_SUFFIX := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-SO_FLAGS := -shared -fPIC
-NVCCFLAGS += $(SO_FLAGS)
+NVCCFLAGS += -shared -fPIC
 NVCCFLAGS += $(PYBIND_INCLUDES) -L${PYTHON_LIBDIR} -lpython${PYTHON_VERSION}
 OUT := _C$(EXT_SUFFIX)
 RUN_CMD := python3 $(basename $(SRC)).py
@@ -53,30 +52,21 @@ RUN_CMD := python3 $(basename $(SRC)).py
 # NVCCFLAGS += -ltorch -lc10_cuda -ltorch_cuda
 # NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
 
-# GPU configuration
-GPU := B200
-
 # NVCC flags
 NVCCFLAGS += -DNDEBUG -lineinfo
 NVCCFLAGS += --expt-extended-lambda --expt-relaxed-constexpr 
 NVCCFLAGS += -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing 
-NVCCFLAGS += --use_fast_math -O3 # Note that --use_fast_math will harm precision
-NVCCFLAGS += -forward-unknown-to-host-compiler 
-NVCCFLAGS += -std=c++20 -x cu -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static -lcublas
+NVCCFLAGS += -forward-unknown-to-host-compiler --ftemplate-backtrace-limit=0
+NVCCFLAGS += -std=c++20 -x cu -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static
+NVCCFLAGS += -O3 --use_fast_math # VERY important to include this flag
 NVCCFLAGS += -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills 
-NVCCFLAGS += -Xcudafe "--diag_suppress=68"
-
-# ThunderKittens includes
 NVCCFLAGS += -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype
+NVCCFLAGS += -DKITTENS_HOPPER -DKITTENS_BLACKWELL -gencode arch=compute_100a,code=sm_100a
 
-# Conditional setup based on the target GPU
-ifeq ($(GPU),H100)
-	NVCCFLAGS+= -DKITTENS_HOPPER -gencode arch=compute_90a,code=sm_90a
-else ifeq ($(GPU), B200)
-	NVCCFLAGS+= -DKITTENS_HOPPER -DKITTENS_BLACKWELL -gencode arch=compute_100a,code=sm_100a
-else
-	$(error Unsupported GPU: $(GPU). Supported GPUs are H100 and B200)
-endif
+# NVCC flags for compatibility with PyTorch extension
+NVCCFLAGS += -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__
+NVCCFLAGS += -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__
+NVCCFLAGS += -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
 
 all: $(OUT)
 
