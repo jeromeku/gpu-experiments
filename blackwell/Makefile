@@ -24,7 +24,8 @@
 # SRC := 22-mxfp8-quantize-opt-2.cu
 # SRC := 23-mxfp8-mma-grid-ablation.cu
 # SRC := 24-mxfp8-quantize-grid-ablation.cu
-SRC := 27-raw-binding.cu
+# SRC := 27-raw-binding.cu
+SRC := 28-tma-load.cu
 
 # Compiler configuration
 NVCC := nvcc
