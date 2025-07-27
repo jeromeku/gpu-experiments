@@ -1,5 +1,5 @@
 /*
-    Minimal TMA load example, no swizzling
+    Minimal TMA store example, no swizzling
 */
 
 #include <kittens.cuh>
