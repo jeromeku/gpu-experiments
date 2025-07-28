@@ -16,7 +16,7 @@ kernel(t_in, t_out)
 torch.cuda.synchronize()
 
 abs_diff = (t_out.view(torch.uint16).to(torch.int32) - t_in.view(torch.uint16).to(torch.int32)).abs()
-print('Max adiff:', abs_diff.max())
+print('Max adiff:', abs_diff.max().item())
 
 l2_cache_size = 1024 * 1024 * 128 # ~128MB for Blackwell
 l2_cache = torch.randn(l2_cache_size // 2, dtype=torch.bfloat16)
@@ -39,4 +39,4 @@ for i in range(10):
 
 avg_time = sum(times) / len(times)
 print(f"Average time: {avg_time * 1e3:.2f} ms")
-print(f"Bandwidth: {M * N * 2 / avg_time / 1e9:.2f} GB/s")
+print(f"Bandwidth: {M * N * 2 * 2 / avg_time / 1e9:.2f} GB/s")

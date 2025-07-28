@@ -2,12 +2,17 @@
     No swizzling. Just loads and stores
 
     Observations:
-        - 32768x32768 with 256x256 tile: 
-        - 16384x16384 with 256x256 tile: 
-        - 32768x32768 with 128x128 tile: 
-        - 16384x16384 with 128x128 tile: 
-        - 32768x32768 with 64x64 tile: 
-        - 16384x16384 with 64x64 tile: 
+        - It seems like cp.async.bulk.commit_group and cp.async.bulk.wait_group
+          are implicitly called at the end of a thread block. Because their presence 
+          here does not affect either the speed or correctness, and they are at the
+          end of everything here.
+
+        - 32768x32768 with 256x256 tile: 6453.76 GB/s
+        - 16384x16384 with 256x256 tile: 5658.18 GB/s
+        - 32768x32768 with 128x128 tile: 4322.00 GB/s
+        - 16384x16384 with 128x128 tile: 3957.28 GB/s
+        - 32768x32768 with 64x64 tile: 1868.48 GB/s
+        - 16384x16384 with 64x64 tile: 1797.54 GB/s
 
 */
 #include <kittens.cuh>
