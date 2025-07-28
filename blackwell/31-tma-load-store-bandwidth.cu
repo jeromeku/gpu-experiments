@@ -14,6 +14,11 @@
         - 32768x32768 with 64x64 tile: 1868.48 GB/s
         - 16384x16384 with 64x64 tile: 1797.54 GB/s
 
+        - Also tried using CU_TENSOR_MAP_L2_PROMOTION_L2_256B.
+          Surprisingly, it decreases the bandwidth by about 2~3%
+        - Just in case I also tried CU_TENSOR_MAP_L2_PROMOTION_L2_64B.
+          This neither increase nor decrease the bandwidth. I think
+          it's safe to stick with no L2 promotion
 */
 #include <kittens.cuh>
 #include <pybind11/pybind11.h>
