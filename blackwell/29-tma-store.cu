@@ -40,7 +40,7 @@ __global__ void kernel(
         int row = 0 * TILE_M;
         int col = 0 * TILE_N;
         asm volatile("{cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {%1, %2}], [%3];}"
-            :: "l"(&tmap), "r"(row), "r"(col), "l"(__cvta_generic_to_shared(t_out_smem))
+            :: "l"(&tmap), "r"(col), "r"(row), "l"(__cvta_generic_to_shared(t_out_smem))
             : "memory");
         asm volatile("{cp.async.bulk.commit_group;}");
         asm volatile("{cp.async.bulk.wait_group %0;}"
