@@ -8,6 +8,14 @@
             - 32768x32768 with 64x64 tile: 1163.31 GB/s
             - 16384x16384 with 64x64 tile: 1107.40 GB/s
 
+        ** with fit DM
+        - No swizzling (from previous tests):
+            - 32768x32768 with 64x64 tile: 6631.39 GB/s
+            - 16384x16384 with 64x64 tile: 5109.48 GB/s
+        - 128B swizzling:
+            - 32768x32768 with 64x64 tile: 6653.17 GB/s
+            - 16384x16384 with 64x64 tile: 5149.13 GB/s
+
         --> As predicted, swizzling itself does NOT increase bandwidth from global to shared,
             which makes sense given that we are loading to every bank anyways in the process.
             Swizzling feature in TMA purely exists to ease user's effort in avoiding bank
@@ -22,8 +30,8 @@ using namespace kittens;
 namespace py = pybind11;
 
 constexpr int rank = 2;
-static constexpr int M = 16384*2;
-static constexpr int N = 16384*2;
+static constexpr int M = 16384
+static constexpr int N = 16384
 static constexpr int TILE_M = 64;
 static constexpr int TILE_N = 64;
 
@@ -102,7 +110,7 @@ __host__ static inline void launch_kernel(py::object &t_in, py::object &t_out) {
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     ));
 
-    static constexpr int DYNAMIC_SMEM = MAX_SHARED_MEMORY - 1024;
+    static constexpr int DYNAMIC_SMEM = TILE_M * TILE_N * 2 + 1024;
     dim3 grid = dim3(N / TILE_N, M / TILE_M);
     CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SMEM));
     kernel<<<grid, 1, DYNAMIC_SMEM, 0>>>(

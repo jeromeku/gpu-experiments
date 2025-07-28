@@ -7,12 +7,13 @@
           here does not affect either the speed or correctness, and they are at the
           end of everything here.
 
-        - 32768x32768 with 256x256 tile: 6453.76 GB/s
-        - 16384x16384 with 256x256 tile: 5658.18 GB/s
-        - 32768x32768 with 128x128 tile: 4322.00 GB/s
-        - 16384x16384 with 128x128 tile: 3957.28 GB/s
-        - 32768x32768 with 64x64 tile: 1868.48 GB/s
-        - 16384x16384 with 64x64 tile: 1797.54 GB/s
+        - (full DM --> fit DM)
+        - 32768x32768 with 256x256 tile: 6453.76 GB/s --> 6459.02 GB/s
+        - 16384x16384 with 256x256 tile: 5658.18 GB/s --> 5636.65 GB/s
+        - 32768x32768 with 128x128 tile: 4322.00 GB/s --> 6476.58 GB/s
+        - 16384x16384 with 128x128 tile: 3957.28 GB/s --> 5790.32 GB/s
+        - 32768x32768 with 64x64 tile: 1868.48 GB/s --> 6259.50 GB/s
+        - 16384x16384 with 64x64 tile: 1797.54 GB/s --> 5453.38 GB/s
 
         - Also tried using CU_TENSOR_MAP_L2_PROMOTION_L2_256B.
           Surprisingly, it decreases the bandwidth by about 2~3%
@@ -124,7 +125,7 @@ __host__ static inline void launch_kernel(py::object &t_in, py::object &t_out) {
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     ));
 
-    static constexpr int DYNAMIC_SMEM = MAX_SHARED_MEMORY - 1024;
+    static constexpr int DYNAMIC_SMEM = TILE_M * TILE_N * 2 + 1024;
     dim3 grid = dim3(N / TILE_N, M / TILE_M);
     CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SMEM));
     kernel<<<grid, 1, DYNAMIC_SMEM, 0>>>(

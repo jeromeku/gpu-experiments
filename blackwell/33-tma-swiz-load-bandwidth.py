@@ -4,8 +4,8 @@ import torch
 from _C import kernel
 
 
-M = 16384*2
-N = 16384*2
+M = 16384
+N = 16384
 
 t_in = torch.arange(
     M * N, dtype=torch.int32, device="cuda"

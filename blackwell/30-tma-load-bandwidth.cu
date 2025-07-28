@@ -1,15 +1,15 @@
 /*
     No swizzling. Just loads
 
-    Observations:
-        - 32768x32768 with 256x256 tile: 6763.61 GB/s
-        - 16384x16384 with 256x256 tile: 5100.41 GB/s
-        - 32768x32768 with 128x128 tile: 3716.68 GB/s
-        - 16384x16384 with 128x128 tile: 3223.72 GB/s
-        - 32768x32768 with 64x64 tile: 1165.34 GB/s
-        - 16384x16384 with 64x64 tile: 1108.01 GB/s
-
+    Observations (full DM --> fit DM):
+        - 32768x32768 with 256x256 tile: 6763.61 GB/s --> 6712.99 GB/s
+        - 16384x16384 with 256x256 tile: 5100.41 GB/s --> 5035.38 GB/s
+        - 32768x32768 with 128x128 tile: 3716.68 GB/s --> 6792.68 GB/s
+        - 16384x16384 with 128x128 tile: 3223.72 GB/s --> 4951.95 GB/s
+        - 32768x32768 with 64x64 tile: 1165.34 GB/s --> 6631.39 GB/s
+        - 16384x16384 with 64x64 tile: 1108.01 GB/s --> 5109.48 GB/s (*varies a lot)
 */
+
 #include <kittens.cuh>
 #include <pybind11/pybind11.h>
 
@@ -97,7 +97,7 @@ __host__ static inline void launch_kernel(py::object &t_in, py::object &t_out) {
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     ));
 
-    static constexpr int DYNAMIC_SMEM = MAX_SHARED_MEMORY - 1024;
+    static constexpr int DYNAMIC_SMEM = TILE_M * TILE_N * 2 + 1024;
     dim3 grid = dim3(N / TILE_N, M / TILE_M);
     CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SMEM));
     kernel<<<grid, 1, DYNAMIC_SMEM, 0>>>(
