@@ -7,6 +7,8 @@
         - Output scale store, registers -> shared memory
         - Output matrix & scale store, shared memory -> global memory
         - TMA descriptor global memory shape
+
+    Reaches about 5900 GB/s. Only 100 GB/s slower than normal version! Hooray!
 */
 
 #include <kittens.cuh>
