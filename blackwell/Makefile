@@ -32,7 +32,8 @@
 # SRC := 32-tma-swiz-load.cu
 # SRC := 33-tma-swiz-load-bandwidth.cu
 # SRC := 34-dma-bandwidth.cu
-SRC := 35-tma-pipeline-bandwidth.cu
+# SRC := 35-tma-pipeline-bandwidth.cu
+SRC := 36-mxfp8-quantize-opt-3.cu
 
 # Compiler configuration
 NVCC := nvcc
