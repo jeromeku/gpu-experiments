@@ -43,6 +43,7 @@
 using namespace kittens;
 namespace py = pybind11;
 
+static constexpr int E = 1;
 static constexpr int M = 204800;
 static constexpr int N = 2048;
 
@@ -67,22 +68,25 @@ void kernel(
     fp8e4m3 *A_fp8_smem = reinterpret_cast<fp8e4m3*>(A_bf16_smem);
     fp8e8m0 *A_sc_smem = reinterpret_cast<fp8e8m0*>(A_fp8_smem + TILE_M * TILE_N); // naturally fulfills alignment
 
+    // Calculate indices
+    int group = blockIdx.z;
+    int row = blockIdx.y * TILE_M;
+    int col = blockIdx.x * TILE_N;
+    int tid = threadIdx.x;
+
     // Initialize mbarriers
     __shared__ semaphore inputs_arrived;
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         init_semaphore(inputs_arrived, 0, 1);
     }
     __syncthreads();
 
-    // Calculate tile index
-    int row = blockIdx.y * TILE_M;
-    int col = blockIdx.x * TILE_N;
-
     // Initiate the load from global memory
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         tma::expect_bytes(inputs_arrived, TILE_M * TILE_N * sizeof(bf16));
-        asm volatile("{cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 [%0], [%1, {%2, %3}], [%4];}"
-            :: "l"(__cvta_generic_to_shared(A_bf16_smem)), "l"(&A_bf16_tmap), "r"(col), "r"(row), "l"(__cvta_generic_to_shared(&inputs_arrived))
+        asm volatile("{cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 [%0], [%1, {%2, %3, %4}], [%5];}"
+            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_bf16_smem))), "l"(&A_bf16_tmap), "r"(col), "r"(row), "r"(group),
+               "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&inputs_arrived)))
             : "memory");
     }
 
@@ -99,12 +103,12 @@ void kernel(
     // Load input matrix from shared memory (swizzled)
     #pragma unroll
     for (int i = 0; i < NUM_Q_BLOCKS; i++) {
-        int q_block_idx = (i + threadIdx.x / 8) % NUM_Q_BLOCKS;
+        int q_block_idx = (i + tid / 8) % NUM_Q_BLOCKS;
         #pragma unroll
         for (int j = 0; j < N_PER_Q_BLOCK; j++) {
-            int offset = threadIdx.x * TILE_N * sizeof(bf16) + // row
+            int offset = tid * TILE_N * sizeof(bf16) + // row
                          q_block_idx * Q_BLOCK_SIZE  * sizeof(bf16) + // Q block
-                         ((threadIdx.x + j) % 16) * sizeof(bf16_2); // element within Q block (swizzled)
+                         ((tid + j) % 16) * sizeof(bf16_2); // element within Q block (swizzled)
             asm volatile("{ld.shared.b32 %0, [%1];}"
                 : "=r"(*reinterpret_cast<uint32_t *>(&A_bf16_reg[i][j]))
                 : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_bf16_smem)) + offset));
@@ -116,7 +120,7 @@ void kernel(
     #pragma unroll
     for (int i = 0; i < NUM_Q_BLOCKS; i++) {
         // A group of 8 threads handles the same Q block segment
-        int q_block_idx = (i + threadIdx.x / 8) % NUM_Q_BLOCKS;
+        int q_block_idx = (i + tid / 8) % NUM_Q_BLOCKS;
 
         // Calculate absolute maximum
         bf16_2 amax = __habs2(A_bf16_reg[i][0]);
@@ -134,9 +138,9 @@ void kernel(
         // Quantize input matrix and store to share memory
         #pragma unroll
         for (int j = 0; j < N_PER_Q_BLOCK; j++) {
-            int offset = threadIdx.x * TILE_N * sizeof(fp8e4m3) + // row
+            int offset = tid * TILE_N * sizeof(fp8e4m3) + // row
                          q_block_idx * Q_BLOCK_SIZE * sizeof(fp8e4m3) + // Q block
-                         ((threadIdx.x + j) % 16) * sizeof(fp8e4m3_2); // element within Q block (swizzled)
+                         ((tid + j) % 16) * sizeof(fp8e4m3_2); // element within Q block (swizzled)
             fp8e4m3 A_fp8_reg[2] = {
                 __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j].x) / scale),
                 __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j].y) / scale)
@@ -150,8 +154,8 @@ void kernel(
     // Store the scales to shared memory. Each thread will access 1 bank, so no need to swizzle,
     // but we do have to follow this complicated layout pattern made by NVIDIA:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-1x
-    int scale_offset = (threadIdx.x % 32) * 16 + // row
-                       (threadIdx.x / 32) * 4; // column
+    int scale_offset = (tid % 32) * 16 + // row
+                       (tid / 32) * 4; // column
     asm volatile("{st.shared.b32 [%0], %1;}" 
         :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_sc_smem)) + scale_offset)
            "r"(*reinterpret_cast<uint32_t *>(&A_sc_reg[0])));
@@ -159,18 +163,18 @@ void kernel(
     // Store to global memory
     asm volatile("{fence.proxy.async.shared::cta;}" ::: "memory"); // make writes to smem visible
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         // Since this is the only store, no need to wait for completion
-        asm volatile("{cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {%1, %2}], [%3];}"
-            :: "l"(&A_fp8_tmap), "r"(col), "r"(row), 
+        asm volatile("{cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3}], [%4];}"
+            :: "l"(&A_fp8_tmap), "r"(col), "r"(row), "r"(group),
                "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_fp8_smem)))
             : "memory");
-        asm volatile("{cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3}], [%4];}"
-            :: "l"(&A_sc_tmap), "n"(0), "r"(col / TILE_N), "r"(row / TILE_M), 
+        asm volatile("{cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3, %4}], [%5];}"
+            :: "l"(&A_sc_tmap), "n"(0), "r"(col / TILE_N), "r"(row / TILE_M), "r"(group),
                "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_sc_smem)))
             : "memory");
-        asm volatile("{cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3}], [%4];}"
-            :: "l"(&A_sc_tmap), "r"(TILE_N * TILE_M / Q_BLOCK_SIZE / 2), "r"(col / TILE_N), "r"(row / TILE_M), 
+        asm volatile("{cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3, %4}], [%5];}"
+            :: "l"(&A_sc_tmap), "r"(TILE_N * TILE_M / Q_BLOCK_SIZE / 2), "r"(col / TILE_N), "r"(row / TILE_M), "r"(group),
                "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_sc_smem)) + TILE_M * TILE_N / Q_BLOCK_SIZE / 2)
             : "memory");
     }
@@ -189,24 +193,24 @@ __host__ static inline T *get_data_ptr(py::object tensor) {
 __host__ static inline void launch_kernel(py::object &A_bf16, py::object &A_fp8, py::object &A_sc) {
     CUtensorMap A_bf16_tmap, A_fp8_tmap, A_sc_tmap;
 
-    static constexpr int A_bf16_rank = 2;
-    static constexpr int A_fp8_rank = 2;
-    static constexpr int A_sc_rank = 3;
+    static constexpr int A_bf16_rank = 3;
+    static constexpr int A_fp8_rank = 3;
+    static constexpr int A_sc_rank = 4;
 
-    uint64_t A_bf16_shape[A_bf16_rank] = {N, M}; // inner-dim first
-    uint64_t A_bf16_stride[A_bf16_rank - 1] = {N * sizeof(bf16)};
-    uint32_t A_bf16_smem_shape[A_bf16_rank] = {TILE_N, TILE_M};
-    uint32_t A_bf16_smem_stride[A_bf16_rank] = {1, 1};
+    uint64_t A_bf16_shape[A_bf16_rank] = {N, M, E}; // inner-dim first
+    uint64_t A_bf16_stride[A_bf16_rank - 1] = {N * sizeof(bf16), M * N * sizeof(bf16)};
+    uint32_t A_bf16_smem_shape[A_bf16_rank] = {TILE_N, TILE_M, 1};
+    uint32_t A_bf16_smem_stride[A_bf16_rank] = {1, 1, 1};
     
-    uint64_t A_fp8_shape[A_fp8_rank] = {N, M};
-    uint64_t A_fp8_stride[A_fp8_rank - 1] = {N * sizeof(fp8e4m3)};
-    uint32_t A_fp8_smem_shape[A_fp8_rank] = {TILE_N, TILE_M};
-    uint32_t A_fp8_smem_stride[A_fp8_rank] = {1, 1};
+    uint64_t A_fp8_shape[A_fp8_rank] = {N, M, E};
+    uint64_t A_fp8_stride[A_fp8_rank - 1] = {N * sizeof(fp8e4m3), M * N * sizeof(fp8e4m3)};
+    uint32_t A_fp8_smem_shape[A_fp8_rank] = {TILE_N, TILE_M, 1};
+    uint32_t A_fp8_smem_stride[A_fp8_rank] = {1, 1, 1};
 
-    uint64_t A_sc_shape[A_sc_rank] = {TILE_N * TILE_M / Q_BLOCK_SIZE, N / TILE_N, M / TILE_M};
-    uint64_t A_sc_stride[A_sc_rank - 1] = {TILE_N * TILE_M / Q_BLOCK_SIZE * sizeof(fp8e8m0), N * TILE_M / Q_BLOCK_SIZE * sizeof(fp8e4m3)};
-    uint32_t A_sc_smem_shape[A_sc_rank] = {TILE_N * TILE_M / Q_BLOCK_SIZE / 2, 1, 1}; // divide into 2 TMA stores
-    uint32_t A_sc_smem_stride[A_sc_rank] = {1, 1, 1};
+    uint64_t A_sc_shape[A_sc_rank] = {TILE_N * TILE_M / Q_BLOCK_SIZE, N / TILE_N, M / TILE_M, E};
+    uint64_t A_sc_stride[A_sc_rank - 1] = {TILE_N * TILE_M / Q_BLOCK_SIZE * sizeof(fp8e8m0), N * TILE_M / Q_BLOCK_SIZE * sizeof(fp8e4m3), M * N / Q_BLOCK_SIZE * sizeof(fp8e4m3)};
+    uint32_t A_sc_smem_shape[A_sc_rank] = {TILE_N * TILE_M / Q_BLOCK_SIZE / 2, 1, 1, 1}; // divide into 2 TMA stores
+    uint32_t A_sc_smem_stride[A_sc_rank] = {1, 1, 1, 1};
 
     CUCHECK(cuTensorMapEncodeTiled(
         &A_bf16_tmap,
@@ -252,7 +256,7 @@ __host__ static inline void launch_kernel(py::object &A_bf16, py::object &A_fp8,
     ));
 
     static constexpr int DYNAMIC_SMEM = TILE_M * TILE_N * sizeof(bf16) + 1024;
-    dim3 grid = dim3(N / TILE_N, M / TILE_M);
+    dim3 grid = dim3(N / TILE_N, M / TILE_M, E);
     CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYNAMIC_SMEM));
     kernel<<<grid, TILE_M, DYNAMIC_SMEM>>>(
         get_data_ptr<bf16>(A_bf16), A_bf16_tmap, get_data_ptr<fp8e4m3>(A_fp8), A_fp8_tmap, get_data_ptr<fp8e8m0>(A_sc), A_sc_tmap
