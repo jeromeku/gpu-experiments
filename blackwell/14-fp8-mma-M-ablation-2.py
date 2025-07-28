@@ -38,7 +38,7 @@ end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 for i in range(NUM_WARMUPS):
     kernel(A, B, C)
 
-l2_cache_size = 1024 * 1024 * 50 # 50 MB for Hopper
+l2_cache_size = 1024 * 1024 * 128 # ~128MB for Blackwell
 l2_cache = torch.randn(l2_cache_size // 2, dtype=torch.bfloat16)
 cache_clear = lambda: (l2_cache.random_(0, 1), torch.cuda.empty_cache())
 
