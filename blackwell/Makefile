@@ -27,7 +27,8 @@
 # SRC := 27-raw-binding.cu
 # SRC := 28-tma-load.cu
 # SRC := 29-tma-store.cu
-SRC := 30-tma-load-bandwidth.cu
+# SRC := 30-tma-load-bandwidth.cu
+SRC := 31-tma-load-store-bandwidth.cu
 
 # Compiler configuration
 NVCC := nvcc
