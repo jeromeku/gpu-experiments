@@ -126,12 +126,12 @@ kernel(A, A_fp8, A_sc)
 torch.cuda.synchronize()
 
 # Check correctness
-# abs_diff = torch.abs(A_fp8_ref.to(torch.float32) - A_fp8.to(torch.float32))
-# print('Max adiff (Kernel-FP8):', abs_diff.max().item())
-# print('Mean adiff (Kernel-FP8):', abs_diff.mean().item())
-# abs_diff = torch.abs(A_sc_ref.to(torch.float32) - A_sc.to(torch.float32))
-# print('Max adiff (Kernel-SC):', abs_diff.max().item())
-# print('Mean adiff (Kernel-SC):', abs_diff.mean().item())
+abs_diff = torch.abs(A_fp8_ref.to(torch.float32) - A_fp8.to(torch.float32))
+print('Max adiff (Kernel-FP8):', abs_diff.max().item())
+print('Mean adiff (Kernel-FP8):', abs_diff.mean().item())
+abs_diff = torch.abs(A_sc_ref.to(torch.float32) - A_sc.to(torch.float32))
+print('Max adiff (Kernel-SC):', abs_diff.max().item())
+print('Mean adiff (Kernel-SC):', abs_diff.mean().item())
 
 # Run kernel transpose
 # print("Running kernel transpose...")
