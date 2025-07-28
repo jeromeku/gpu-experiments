@@ -30,7 +30,9 @@
 # SRC := 30-tma-load-bandwidth.cu
 # SRC := 31-tma-load-store-bandwidth.cu
 # SRC := 32-tma-swiz-load.cu
-SRC := 33-tma-swiz-load-bandwidth.cu
+# SRC := 33-tma-swiz-load-bandwidth.cu
+# SRC := 34-dma-bandwidth.cu
+SRC := 35-tma-bandwidth-opt.cu
 
 # Compiler configuration
 NVCC := nvcc
