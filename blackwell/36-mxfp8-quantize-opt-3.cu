@@ -30,6 +30,11 @@
           We need to ensure gmem <-> smem is always fully saturated, and smem <-> reg should 
           bother this as little as possible.
         ** Note: I changed the load part to full load, and speed wasn't changed. Maybe this isn't the case **
+    
+    Observation 5
+        - Bank conflict is a real thing
+        - Changing just the load pattern to non-swizzled degrades perf down to 4030 GB/s
+        - Changing load and store pattern to non-swizzled (thus result correct) degrades perf down to 2901 GB/s. 2x slower!
 */
 
 #include <kittens.cuh>
