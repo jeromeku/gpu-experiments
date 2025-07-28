@@ -16,8 +16,8 @@ using namespace kittens;
 namespace py = pybind11;
 
 static constexpr int E = 1;
-static constexpr int M = 2048;
-static constexpr int N = 204800;
+static constexpr int M = 204800;
+static constexpr int N = 2048;
 
 // Changing these requires re-writing the kernel
 static constexpr int TILE_M = 128;
@@ -78,16 +78,20 @@ void kernel(
     for (int i = 0; i < NUM_Q_BLOCKS; i++) {
         int q_block_idx = (i + tid / 8) % NUM_Q_BLOCKS;
         #pragma unroll
-        for (int j = 0; j < N_PER_Q_BLOCK; j++) {
-            int tile_col = q_block_idx * Q_BLOCK_SIZE + ((tid + j) % N_PER_Q_BLOCK) * 2;
+        for (int j = 0; j < N_PER_Q_BLOCK / 2; j++) {
+            int tile_col = q_block_idx * Q_BLOCK_SIZE + ((tid + j) * 4) % Q_BLOCK_SIZE;
             int offset = (tile_row + tile_col * TILE_N) * sizeof(bf16);
-            asm volatile("{ld.shared.b16 %0, [%1];}" // can't do b32 packed load
-                : "=h"(*reinterpret_cast<uint16_t*>(&A_bf16_reg[i][j].x))
-                : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_bf16_smem)) + offset));
-            offset += TILE_N * sizeof(bf16);
-            asm volatile("{ld.shared.b16 %0, [%1];}"
-                : "=h"(*reinterpret_cast<uint16_t*>(&A_bf16_reg[i][j].y))
-                : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_bf16_smem)) + offset));
+            #pragma unroll
+            for (int k = 0; k < 2; k++) {
+                asm volatile("{ld.shared.b16 %0, [%1];}" // can't do b32 packed load
+                    : "=h"(*reinterpret_cast<uint16_t*>(&A_bf16_reg[i][j * 2 + k].x))
+                    : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_bf16_smem)) + offset));
+                offset += TILE_N * sizeof(bf16);
+                asm volatile("{ld.shared.b16 %0, [%1];}"
+                    : "=h"(*reinterpret_cast<uint16_t*>(&A_bf16_reg[i][j * 2 + k].y))
+                    : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_bf16_smem)) + offset));
+                offset += TILE_N * sizeof(bf16);
+            }
         }
     }
     __syncthreads();
@@ -113,25 +117,18 @@ void kernel(
 
         // Quantize input matrix and store to share memory
         #pragma unroll
-        for (int j = 0; j < N_PER_Q_BLOCK; j++) {
-            int tile_col = q_block_idx * Q_BLOCK_SIZE + ((tid + j) % N_PER_Q_BLOCK) * 2;
+        for (int j = 0; j < N_PER_Q_BLOCK / 2; j++) {
+            int tile_col = q_block_idx * Q_BLOCK_SIZE + ((tid + j) * 4) % Q_BLOCK_SIZE;
             int offset = (tile_row * TILE_N + tile_col) * sizeof(fp8e4m3);
-            // fp8e4m3 A_fp8_reg[4] = {
-            //     __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j + 0].x) / scale),
-            //     __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j + 0].y) / scale),
-            //     __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j + 1].x) / scale),
-            //     __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j + 1].y) / scale)
-            // };
-            fp8e4m3 A_fp8_reg[2] = {
-                __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j].x) / scale),
-                __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j].y) / scale)
+            fp8e4m3 A_fp8_reg[4] = {
+                __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j * 2 + 0].x) / scale),
+                __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j * 2 + 0].y) / scale),
+                __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j * 2 + 1].x) / scale),
+                __nv_fp8_e4m3(__bfloat162float(A_bf16_reg[i][j * 2 + 1].y) / scale)
             };
-            asm volatile("{st.shared.b16 [%0], %1;}"
+            asm volatile("{st.shared.b32 [%0], %1;}"
                 :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_fp8_smem)) + offset)
-                   "h"(*reinterpret_cast<uint16_t *>(&A_fp8_reg[0])));
-            // asm volatile("{st.shared.b32 [%0], %1;}"
-            //     :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(A_fp8_smem)) + offset)
-            //        "r"(*reinterpret_cast<uint32_t *>(&A_fp8_reg[0])));
+                   "r"(*reinterpret_cast<uint32_t *>(&A_fp8_reg[0])));
         }
     }
 
