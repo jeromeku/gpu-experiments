@@ -34,7 +34,8 @@
 # SRC := 34-dma-bandwidth.cu
 # SRC := 35-tma-pipeline-bandwidth.cu
 # SRC := 36-mxfp8-quantize-opt-3.cu
-SRC := 37-mxfp8-transpose-quantize.cu
+# SRC := 37-mxfp8-transpose-quantize.cu
+SRC := 38-mxfp8-quantize-combined.cu
 
 # Compiler configuration
 NVCC := nvcc
