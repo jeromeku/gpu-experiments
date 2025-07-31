@@ -7,6 +7,12 @@
         - Pure M=128 K=128 N=128 : 2130 TFLOPs
         - Pure M=256 K=128 N=128 : 2640 TFLOPs (previous test)
         - This M=128 K=128 N=128 : 2626 TFLOPs
+
+    Re-benchmarked:
+        - 4096x4096x4096 : 1145.42 TFLOp/s
+        - 8192x8192x8192 : 2410.69 TFLOp/s
+        - 16384x16384x16384 : 2732.20 TFLOp/s
+        - 204800x2048x1536 : 2263.42 TFLOp/s
 */
 
 #include "kittens.cuh"
