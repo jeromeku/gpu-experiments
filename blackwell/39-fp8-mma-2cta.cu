@@ -14,6 +14,12 @@
             - 8192x8192x8192 : 3200.70 TFLOp/s
             - 16384x16384x16384 : 3300.45 TFLOp/s
             - 204800x2048x1536 : 2887.71 TFLOp/s (changed dim for yet supported granularity)
+        
+        ^ + WITH L2 cache clear (this file)
+            - 4096x4096x4096 : 1231.25 TFLOp/s
+            - 8192x8192x8192 : 2836.37 TFLOp/s
+            - 16384x16384x16384 : 3202.16 TFLOp/s
+            - 204800x2048x1536 : 2707.09 TFLOp/s
 
         ^ + pipeline factored out
         ^ + doing 256x128x256 instead of 512x128x256

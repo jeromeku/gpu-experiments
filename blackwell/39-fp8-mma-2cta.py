@@ -7,9 +7,9 @@ from _C import kernel
 
 
 # Matrix dimensions
-M = 8192
-K = 8192
-N = 8192
+M = 16384
+K = 16384
+N = 16384
 
 assert M % 512 == 0
 assert K % 128 == 0 and K >= 512
@@ -48,7 +48,7 @@ l2_cache = torch.randn(l2_cache_size // 2, dtype=torch.bfloat16)
 cache_clear = lambda: l2_cache.random_(0, 1)
 
 for i in range(NUM_ITERS):
-    # cache_clear()
+    cache_clear()
     start_events[i].record()
     kernel(A, B, C)
     end_events[i].record()
