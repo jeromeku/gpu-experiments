@@ -146,8 +146,6 @@ void kernel(const __grid_constant__ globals G) {
     // Main divergence
     if (warpgroup_id == config::NUM_WARPGROUPS - 1) {
         // Producer group
-        warpgroup::decrease_registers<config::PRODUCER_REGISTERS>();
-
         if (warp_id == 3 && lane_id == 0) {
             // Load input matrices
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {
@@ -185,29 +183,28 @@ void kernel(const __grid_constant__ globals G) {
                 tma::cluster::wait(inputs_finished[last_stage], get_phasebit<1>(phasebits, last_stage));
                 arrive(outputs_arrived);
             }
-        } else if (cta_id == 0 && warp_id <= 1 && lane_id == 0) {
+        } else if (cta_id == 0 && warp_id == 0 && lane_id <= 1) {
             // Launch tensor core matrix multiply
-            tm_t tm = tm_allocator.allocate<tm_t>(warp_id * globals::COL_BLOCK);
+            tm_t tm = tm_allocator.allocate<tm_t>(lane_id * globals::COL_BLOCK);
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {                
                 for (int red_block_idx = 0; red_block_idx < num_iters; red_block_idx++) {
                     if (red_block_idx == 0) {
-                        tma::cluster::wait(outputs_finished[warp_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                        tma::cluster::wait(outputs_finished[lane_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
                         update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
                     }
                     tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
                     if (red_block_idx == 0)
-                        mm2_ABt(tm, inputs[stage].A[warp_id], inputs[stage].B, inputs_finished[stage]);
+                        mm2_ABt(tm, inputs[stage].A[lane_id], inputs[stage].B, inputs_finished[stage]);
                     else
-                        mma2_ABt(tm, inputs[stage].A[warp_id], inputs[stage].B, inputs_finished[stage]);
+                        mma2_ABt(tm, inputs[stage].A[lane_id], inputs[stage].B, inputs_finished[stage]);
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
             }
         }
     } else {
         // Consumer group
-        warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
         tm_t tm = tm_allocator.allocate<tm_t>(warpgroup_id * globals::COL_BLOCK);
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {
