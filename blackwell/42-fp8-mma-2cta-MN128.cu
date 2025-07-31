@@ -30,14 +30,14 @@
             - 16384x16384x16384 : 3190.50 TFLOp/s
             - 204800x2048x1536 : 2652.84 TFLOp/s
 
-        ^ + doing 256x128x256 instead of 512x128x256 (this file)
+        ^ + doing 256x128x256 instead of 512x128x256
           + with less smem usage, we can increase pipeline stages --> 5 stages perform the best (gets slow on 6)
             - 4096x4096x4096 : 1300.71 TFLOp/s
             - 8192x8192x8192 : 2763.66 TFLOp/s
             - 16384x16384x16384 : 3033.94 TFLOp/s
             - 204800x2048x1536 : 2490.36 TFLOp/s
 
-        ^ + supporting 128 granularity on M & N
+        ^ + supporting 128 granularity on M & N (this file)
             - 4096x4096x4096 : 1281.16 TFLOp/s
             - 8192x8192x8192 : 2719.50 TFLOp/s
             - 16384x16384x16384 : 2898.47 TFLOp/s (degraded due to GPU. probably should add about 100 TFLOPs to this)
