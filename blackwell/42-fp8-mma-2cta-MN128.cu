@@ -221,7 +221,6 @@ struct fp8_matmul_base {
         for (int i = 0; i < 2; i++) {
             if (S.is_tail_col && i == 1)
                 break;
-
             if (S.consumer_id == i) {
                 warpgroup::store(S.outputs.C, C_reg);
                 warpgroup::sync(2 + i);
@@ -235,8 +234,8 @@ struct fp8_matmul_base {
     }
 
     __device__ static inline void main_loop(const globals &G, state &S) {
-        const int col_has_tail = G.C.cols() % COL_BLOCK != 0;
-        const int row_has_tail = G.C.rows() % ROW_BLOCK != 0;
+        const int col_has_tail = (G.C.cols() / (COL_BLOCK / 2)) & 0b1;
+        const int row_has_tail = (G.C.rows() / (ROW_BLOCK / 2)) & 0b1;
         const int num_blocks_per_row = G.C.cols() / COL_BLOCK + col_has_tail;
         const int num_blocks_per_col = G.C.rows() / ROW_BLOCK + row_has_tail;
         const int num_blocks = num_blocks_per_row * num_blocks_per_col;
