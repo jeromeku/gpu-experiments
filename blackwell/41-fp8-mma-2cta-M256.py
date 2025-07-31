@@ -11,7 +11,7 @@ M = 16384
 K = 16384
 N = 16384
 
-assert M % 512 == 0
+assert M % 256 == 0
 assert K % 128 == 0 and K >= 512
 assert N % 256 == 0
 

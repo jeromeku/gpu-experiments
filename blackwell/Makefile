@@ -37,7 +37,8 @@
 # SRC := 37-mxfp8-transpose-quantize.cu
 # SRC := 38-mxfp8-quantize-combined.cu
 # SRC := 39-fp8-mma-2cta.cu
-SRC := 40-fp8-mma-2cta-factored.cu
+# SRC := 40-fp8-mma-2cta-factored.cu
+SRC := 41-fp8-mma-2cta-M256.cu
 
 # Compiler configuration
 NVCC := nvcc

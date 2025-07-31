@@ -24,13 +24,19 @@
             - 16384x16384x16384 : 3202.16 TFLOp/s
             - 204800x2048x1536 : 2707.09 TFLOp/s
 
-        ^ + pipeline factored out (this file):
+        ^ + pipeline factored out
             - 4096x4096x4096 : 1243.66 TFLOp/s
             - 8192x8192x8192 : 2900.05 TFLOp/s
             - 16384x16384x16384 : 3190.50 TFLOp/s
             - 204800x2048x1536 : 2652.84 TFLOp/s
 
-        ^ + doing 256x128x256 instead of 512x128x256
+        ^ + doing 256x128x256 instead of 512x128x256 (this file)
+          + with less smem usage, we can increase pipeline stages --> 5 stages perform the best (gets slow on 6)
+            - 4096x4096x4096 : 1300.71 TFLOp/s
+            - 8192x8192x8192 : 2763.66 TFLOp/s
+            - 16384x16384x16384 : 3033.94 TFLOp/s
+            - 204800x2048x1536 : 2490.36 TFLOp/s
+
         ^ + supporting 128 granularity on M
         ^ + supporting 128 granularity on N
         ^ + supporting 128 granularity on K
@@ -46,7 +52,7 @@ using namespace kittens::prototype;
 struct fp8_matmul_base {
 
     // Pipeline stages
-    static constexpr int PIPELINE_STAGES = 4;
+    static constexpr int PIPELINE_STAGES = 5;
 
     // Per-block dimensions
     static constexpr int ROW_BLOCK = 256;
@@ -54,7 +60,7 @@ struct fp8_matmul_base {
     static constexpr int RED_BLOCK = 128; // reduction axis
 
     // Supergrouping for higher L2 utilization
-    static constexpr int SUPERGROUP_SIZE = 8;
+    static constexpr int SUPERGROUP_SIZE = 12;
 
     // Kernel configuration
     struct config {
@@ -77,7 +83,7 @@ struct fp8_matmul_base {
     // Type aliases
     using A_tile = st_fp8e4m3<ROW_BLOCK / 2, RED_BLOCK>; // CTA distributed
     using B_tile = st_fp8e4m3<COL_BLOCK / 2, RED_BLOCK>; // CTA distributed
-    using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK / 4>;  // CTA distributed + array-divided
+    using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK / 2>;  // CTA distributed + WG divided
     using tm_t = tt<float, ROW_BLOCK / 2, COL_BLOCK>;
     using consumer = group<config::NUM_CONSUMERS * WARPGROUP_WARPS>;
 
@@ -111,7 +117,6 @@ struct fp8_matmul_base {
         const bool is_consumer;     // 2 warpgroups
 
         const int cta_id;      // 0 or 1
-        const int launcher_id; // 0 or 1 (valid if is_launcher)
         const int consumer_id; // 0 or 1 (valid if is_consumer)
 
         int row_block_idx;
@@ -184,15 +189,11 @@ struct fp8_matmul_base {
         update_phasebit<0>(S.phasebits, PIPELINE_STAGES);
 
         // Load the output from tensor memory into registers
-        rt_bf<ROW_BLOCK / 16, COL_BLOCK / 4> C_reg[4];
+        rt_bf<ROW_BLOCK / 8, COL_BLOCK / 2> C_reg;
         if (S.red_block_start >= S.red_block_end) {
-            #pragma unroll
-            for (int i = 0; i < 4; i++)
-                warp::zero(C_reg[i]);
+            warp::zero(C_reg);
         } else {
-            #pragma unroll
-            for (int i = 0; i < 4; i++)
-                consumer::load_async(C_reg[i], tm.subtile<tt<float, ROW_BLOCK / 2, COL_BLOCK / 4>>(0, i * COL_BLOCK / 4));
+            warpgroup::load_async(C_reg, tm.subtile<tt<float, ROW_BLOCK / 2, COL_BLOCK / 2>>(0, S.consumer_id * COL_BLOCK / 2));
             tensor_load_wait();
             consumer::sync(1);
             if (consumer::laneid() == 0)
@@ -200,12 +201,14 @@ struct fp8_matmul_base {
         }
 
         #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            consumer::store(S.outputs.C, C_reg[j]);
-            consumer::sync(1);
-            if (consumer::laneid() == 0) {
-                tma::store_async(G.C, S.outputs.C, {S.row_block_idx * 2 + S.cta_id, S.col_block_idx * 4 + j});
-                tma::store_async_read_wait();
+        for (int i = 0; i < 2; i++) {
+            if (S.consumer_id == i) {
+                warpgroup::store(S.outputs.C, C_reg);
+                warpgroup::sync(2 + i);
+                if (warpgroup::laneid() == 0) {
+                    tma::store_async(G.C, S.outputs.C, {S.row_block_idx * 2 + S.cta_id, S.col_block_idx * 2 + i});
+                    tma::store_async_read_wait();
+                }
             }
             consumer::sync(1);
         }
@@ -268,36 +271,41 @@ struct fp8_matmul_base {
             init_semaphore(outputs_finished, 0, config::CLUSTER_SIZE);
         }
         everyone::tma::cluster::sync();
-    
+
+        // Get thread/block indices
+        int lane_id = warp::laneid();
+        int warp_id = warpgroup::warpid();
+        int warpgroup_id = warpgroup::groupid();
+        int cta_id = cluster_ctarank();
+
         // Set up matmul pipeline state
         state S {
-            .is_input_loader = (warpgroup::groupid() == config::NUM_CONSUMERS) && (warpgroup::warpid() == 3) && (warp::laneid() == 0),
-            .is_launcher = (warpgroup::groupid() == config::NUM_CONSUMERS) && (cluster_ctarank() == 0) && (warpgroup::warpid() == 0) && (warp::laneid() == 0),
-            .is_consumer = warpgroup::groupid() < config::NUM_CONSUMERS,
-    
-            .cta_id = cluster_ctarank(),
-            .launcher_id = warp::laneid(),
-            .consumer_id = warpgroup::groupid(),
+            .is_input_loader = (warpgroup_id == config::NUM_CONSUMERS) && (warp_id == 3) && (lane_id == 0),
+            .is_launcher = (warpgroup_id == config::NUM_CONSUMERS) && (cta_id == 0) && (warp_id == 0) && (lane_id == 0),
+            .is_consumer = warpgroup_id < config::NUM_CONSUMERS,
+
+            .cta_id = cta_id,
+            .consumer_id = warpgroup_id,
     
             .row_block_idx = 0,
             .col_block_idx = 0,
             .red_block_start = 0,
             .red_block_end = 0,
-    
+
             .inputs = inputs,
             .outputs = outputs,
             .tm_allocator = tm_allocator,
-    
+
             .inputs_arrived = inputs_arrived,
             .inputs_finished = inputs_finished,
             .outputs_arrived = outputs_arrived,
             .outputs_finished = outputs_finished,
-    
+
             .stage = 0,
             .last_stage = PIPELINE_STAGES,
             .phasebits = 0xFFFF'0000,
         };
-    
+
         // Execute the pipeline
         main_loop(G, S);
 
