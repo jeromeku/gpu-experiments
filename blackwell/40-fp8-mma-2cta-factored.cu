@@ -1,7 +1,10 @@
 /*
-    2-CTA FP8 Matrix Multiplication
+    2-CTA FP8 Matrix Multiplication, refactored.
+    The refactored version allows easily creating different variants of matmuls, by inheriting the base class
+    and overriding one or two functions. Specifically, it makes it easier to change which row/col/reduction range
+    is handled at each phase.
 
-    Benchmarks:
+    Benchmarks so far:
 
         Pure C++ (Thunderkittens/kernels/matmul/FP8_B200):
             - 4096x4096x4096 : 2107.6 TFLOPs
@@ -22,10 +25,10 @@
             - 204800x2048x1536 : 2707.09 TFLOp/s
 
         ^ + pipeline factored out (this file):
-            - 4096x4096x4096 : 
-            - 8192x8192x8192 : 
-            - 16384x16384x16384 : 
-            - 204800x2048x1536 : 
+            - 4096x4096x4096 : 1243.66 TFLOp/s
+            - 8192x8192x8192 : 2900.05 TFLOp/s
+            - 16384x16384x16384 : 3190.50 TFLOp/s
+            - 204800x2048x1536 : 2652.84 TFLOp/s
 
         ^ + doing 256x128x256 instead of 512x128x256
         ^ + supporting 128 granularity on M
@@ -66,19 +69,22 @@ struct fp8_matmul_base {
         static constexpr int NUM_WARPGROUPS = NUM_CONSUMERS + NUM_PRODUCERS;
         static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
         static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+        static constexpr int PRODUCER_REGISTERS = 56;
+        static constexpr int CONSUMER_REGISTERS = 224;
     };
 
     // Type aliases
     using A_tile = st_fp8e4m3<ROW_BLOCK / 4, RED_BLOCK>; // WG/CTA distributed
     using B_tile = st_fp8e4m3<COL_BLOCK / 2, RED_BLOCK>; // CTA distributed
-    using C_tile = st_hf<ROW_BLOCK / 4, COL_BLOCK / 4>;  // WG/CTA distributed + array-divided
+    using C_tile = st_bf<ROW_BLOCK / 4, COL_BLOCK / 4>;  // WG/CTA distributed + array-divided
     using tm_t = tt<float, ROW_BLOCK / 4, COL_BLOCK>;
     using consumer = group<config::NUM_CONSUMERS * WARPGROUP_WARPS>;
 
     struct globals {
         using A_gl = gl<fp8e4m3, 1, 1, -1, -1, A_tile>;
         using B_gl = gl<fp8e4m3, 1, 1, -1, -1, B_tile>;
-        using C_gl = gl<half,    1, 1, -1, -1, C_tile>;
+        using C_gl = gl<bf16,    1, 1, -1, -1, C_tile>;
     
         A_gl A;
         B_gl B;
@@ -179,14 +185,20 @@ struct fp8_matmul_base {
         update_phasebit<0>(S.phasebits, PIPELINE_STAGES);
 
         // Load the output from tensor memory into registers
-        rt_hf<ROW_BLOCK / 16, COL_BLOCK / 4> C_reg[4];
-        #pragma unroll
-        for (int i = 0; i < 4; i++)
-            warpgroup::load_async(C_reg[i], tm.subtile<tt<float, ROW_BLOCK / 4, COL_BLOCK / 4>>(0, i * COL_BLOCK / 4));
-        tensor_load_wait();
-        warpgroup::sync(2 + S.consumer_id);
-        if (warpgroup::laneid() == 0)
-            tma::cluster::arrive(S.outputs_finished[S.consumer_id], 0, 1); // signal CTA 0
+        rt_bf<ROW_BLOCK / 16, COL_BLOCK / 4> C_reg[4];
+        if (S.red_block_start >= S.red_block_end) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                warp::zero(C_reg[i]);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                warpgroup::load_async(C_reg[i], tm.subtile<tt<float, ROW_BLOCK / 4, COL_BLOCK / 4>>(0, i * COL_BLOCK / 4));
+            tensor_load_wait();
+            warpgroup::sync(2 + S.consumer_id);
+            if (warpgroup::laneid() == 0)
+                tma::cluster::arrive(S.outputs_finished[S.consumer_id], 0, 1); // signal CTA 0
+        }
 
         #pragma unroll
         for (int i = 0; i < 2; i++) {
@@ -206,63 +218,34 @@ struct fp8_matmul_base {
         }
     }
 
-    __device__ static inline void dispatch_prologue(const globals &G, state &S) {
-        if (threadIdx.x == 32) {
-            #pragma unroll
-            for (int i = 0; i < PIPELINE_STAGES; i++) {
-                init_semaphore(S.inputs_arrived[i], 0, config::CLUSTER_SIZE);
-                init_semaphore(S.inputs_finished[i], 0, config::NUM_CONSUMERS);
-            }
-            init_semaphore(S.outputs_arrived, 0, 1);
-            #pragma unroll
-            for (int i = 0; i < config::NUM_CONSUMERS; i++) {
-                init_semaphore(S.outputs_finished[i], 0, config::CLUSTER_SIZE);
-            }
-        }
-        everyone::tma::cluster::sync();
-    }
-
-    __device__ static inline void dispatch_main_loop_body(const globals &G, state &S) {
-        if (S.is_input_loader) {
-            input_loader_loop(G, S);
-        } else if (S.is_launcher) {
-            launcher_loop(G, S);
-        } else if (S.is_consumer) {
-            consumer_loop(G, S);
-        }
-    }
-
-    __device__ static inline void dispatch_main_loop(const globals &G, state &S) {
-        const int cluster_id = clusterIdx().x;
+    __device__ static inline void main_loop(const globals &G, state &S) {
         const int num_blocks_per_row = G.C.cols() / COL_BLOCK;
         const int num_blocks_per_col = G.C.rows() / ROW_BLOCK;
         const int num_blocks = num_blocks_per_row * num_blocks_per_col;
-        const int num_iters = G.A.cols() / RED_BLOCK;
         const int num_blocks_per_supergroup = SUPERGROUP_SIZE * num_blocks_per_row;
 
         S.red_block_start = 0;
-        S.red_block_end = num_iters;
+        S.red_block_end = G.A.cols() / RED_BLOCK;
 
-        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {
+        for (int block_idx = clusterIdx().x; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
             int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
             int rows_in_supergroup = min(SUPERGROUP_SIZE, num_blocks_per_col - supergroup_idx * SUPERGROUP_SIZE);
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+
             S.row_block_idx = supergroup_idx * SUPERGROUP_SIZE + row_within_supergroup;
             S.col_block_idx = idx_within_supergroup / rows_in_supergroup;
-            dispatch_main_loop_body(G, S);
+
+            if (S.is_input_loader)
+                input_loader_loop(G, S);
+            else if (S.is_launcher)
+                launcher_loop(G, S);
+            else if (S.is_consumer)
+                consumer_loop(G, S);
         }
     }
 
-    __device__ static inline void dispatch_epilogue(const globals &G, state &S) {
-        if (S.is_input_loader && S.last_stage < PIPELINE_STAGES) {
-            tma::cluster::wait(S.inputs_finished[S.last_stage], get_phasebit<1>(S.phasebits, S.last_stage));
-            arrive(S.outputs_arrived);
-        }
-        everyone::tma::cluster::sync(); // for tm_allocator destructor
-    }
-
-    __device__ static inline void entrypoint(const globals &G) {
+    __device__ static inline void dispatcher(const globals &G) {
         // Declare shared memory
         extern __shared__ int __shm[]; 
         tma_swizzle_allocator sm_allocator((int*)&__shm[0]);
@@ -280,6 +263,21 @@ struct fp8_matmul_base {
         __shared__ semaphore inputs_finished[PIPELINE_STAGES];
         __shared__ semaphore outputs_arrived;
         __shared__ semaphore outputs_finished[config::NUM_CONSUMERS];
+
+        // Initialize mbarriers
+        if (threadIdx.x == 32) {
+            #pragma unroll
+            for (int i = 0; i < PIPELINE_STAGES; i++) {
+                init_semaphore(inputs_arrived[i], 0, config::CLUSTER_SIZE);
+                init_semaphore(inputs_finished[i], 0, config::NUM_CONSUMERS);
+            }
+            init_semaphore(outputs_arrived, 0, 1);
+            #pragma unroll
+            for (int i = 0; i < config::NUM_CONSUMERS; i++) {
+                init_semaphore(outputs_finished[i], 0, config::CLUSTER_SIZE);
+            }
+        }
+        everyone::tma::cluster::sync();
     
         // Set up matmul pipeline state
         state S {
@@ -290,12 +288,12 @@ struct fp8_matmul_base {
             .cta_id = cluster_ctarank(),
             .launcher_id = warp::laneid(),
             .consumer_id = warpgroup::groupid(),
-
+    
             .row_block_idx = 0,
             .col_block_idx = 0,
             .red_block_start = 0,
             .red_block_end = 0,
-
+    
             .inputs = inputs,
             .outputs = outputs,
             .tm_allocator = tm_allocator,
@@ -309,11 +307,26 @@ struct fp8_matmul_base {
             .last_stage = PIPELINE_STAGES,
             .phasebits = 0xFFFF'0000,
         };
-
+    
         // Execute the pipeline
-        dispatch_prologue(G, S);
-        dispatch_main_loop(G, S);
-        dispatch_epilogue(G, S);
+        main_loop(G, S);
+
+        // Pipeline epilogue
+        if (S.is_input_loader && S.last_stage < PIPELINE_STAGES) {
+            tma::cluster::wait(S.inputs_finished[S.last_stage], get_phasebit<1>(S.phasebits, S.last_stage));
+            arrive(S.outputs_arrived);
+        }
+        everyone::tma::cluster::sync(); // for tm_allocator destructor
+    }
+
+    __device__ static inline void entrypoint(const globals &G) {
+        if (warpgroup::groupid() == config::NUM_CONSUMERS) {
+            warpgroup::decrease_registers<config::PRODUCER_REGISTERS>();
+            dispatcher(G);
+        } else {
+            warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
+            dispatcher(G);
+        }
     }
 };
 

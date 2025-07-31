@@ -49,8 +49,8 @@ struct config {
     static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
-    static constexpr int PRODUCER_REGISTERS = 56;
-    static constexpr int CONSUMER_REGISTERS = 224;
+    static constexpr int PRODUCER_REGISTERS = 72;
+    static constexpr int CONSUMER_REGISTERS = 216;
 };
 
 // Kernel globals
@@ -146,6 +146,8 @@ void kernel(const __grid_constant__ globals G) {
     // Main divergence
     if (warpgroup_id == config::NUM_WARPGROUPS - 1) {
         // Producer group
+        warpgroup::decrease_registers<config::PRODUCER_REGISTERS>();
+
         if (warp_id == 3 && lane_id == 0) {
             // Load input matrices
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {
@@ -205,6 +207,7 @@ void kernel(const __grid_constant__ globals G) {
         }
     } else {
         // Consumer group
+        warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
         tm_t tm = tm_allocator.allocate<tm_t>(warpgroup_id * globals::COL_BLOCK);
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {
