@@ -7,9 +7,9 @@ from _C import kernel
 
 
 # Matrix dimensions
-M = 16384 + 128
-K = 16384 + 128
-N = 16384 + 128
+M = 16384 - 128
+K = 16384
+N = 16384 - 128
 
 assert M % 128 == 0
 assert K % 128 == 0 and K >= 512

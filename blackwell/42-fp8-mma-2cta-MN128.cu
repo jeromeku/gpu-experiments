@@ -38,10 +38,10 @@
             - 204800x2048x1536 : 2490.36 TFLOp/s
 
         ^ + supporting 128 granularity on M & N
-            - 4096x4096x4096 : 
-            - 8192x8192x8192 : 
-            - 16384x16384x16384 : 
-            - 204800x2048x1536 : 
+            - 4096x4096x4096 : 1281.16 TFLOp/s
+            - 8192x8192x8192 : 2719.50 TFLOp/s
+            - 16384x16384x16384 : 2898.47 TFLOp/s (degraded due to GPU. probably should add about 100 TFLOPs to this)
+            - 204800x2048x1536 : 2486.30 TFLOp/s
 
         ^ + supporting 128 granularity on K
 */
@@ -128,9 +128,6 @@ struct fp8_matmul_base {
         int red_block_start;
         int red_block_end;
 
-        bool is_tail_row;
-        bool is_tail_col;
-
         pipeline_inputs (&inputs)[PIPELINE_STAGES];
         pipeline_outputs &outputs;
 
@@ -146,8 +143,10 @@ struct fp8_matmul_base {
         uint32_t phasebits;
     };
 
-    template <typename Globals>
-    __device__ static inline void input_loader_loop(const Globals &G, state &S) {
+    template <bool load_A, bool load_B>
+    __device__ static inline void input_loader_loop(const globals &G, state &S) {
+        constexpr int bytes_per_iter = (load_A ? sizeof(A_tile) : 0) + (load_B ? sizeof(B_tile) : 0);
+
         for (int red_block_idx = S.red_block_start; red_block_idx < S.red_block_end; red_block_idx++) {
             tma::cluster::wait(S.inputs_finished[S.stage], get_phasebit<1>(S.phasebits, S.stage));
             update_phasebit<1>(S.phasebits, S.stage);
@@ -158,15 +157,14 @@ struct fp8_matmul_base {
             }
 
             // Load to current CTA, but signal mbarrier at CTA 0 (tma::cluster is purely for cluster-level synchronization)
-            int expected_bytes = ((S.is_tail_row && S.cta_id == 1) ? 0 : sizeof(A_tile)) + ((S.is_tail_col && S.cta_id == 1) ? 0 : sizeof(B_tile));
-            if (expected_bytes) {
-                tma::cluster::expect_bytes(S.inputs_arrived[S.stage], expected_bytes, 0);
-                if (!S.is_tail_row || S.cta_id == 0) 
-                    tma::cluster::load_async(S.inputs[S.stage].A, G.A, {S.row_block_idx * 2 + S.cta_id, red_block_idx}, S.inputs_arrived[S.stage], (uint16_t)(1 << S.cta_id), 0);
-                if (!S.is_tail_col || S.cta_id == 0)
+            if constexpr (load_A || load_B) {
+                tma::cluster::expect_bytes(S.inputs_arrived[S.stage], bytes_per_iter, 0);
+                if constexpr (load_A)
+                    tma::cluster::load_async(S.inputs[S.stage].A, G.A, {S.row_block_idx * 2 + S.cta_id, red_block_idx}, S.inputs_arrived[S.stage], (uint16_t)(1 << S.cta_id), 0); 
+                if constexpr (load_B)
                     tma::cluster::load_async(S.inputs[S.stage].B, G.B, {S.col_block_idx * 2 + S.cta_id, red_block_idx}, S.inputs_arrived[S.stage], (uint16_t)(1 << S.cta_id), 0);
             } else {
-                tma::cluster::arrive(S.inputs_arrived[S.stage], 0, 1);
+                tma::cluster::arrive(S.inputs_arrived[S.stage], 0, 1); // signal immediately
             }
 
             if (red_block_idx == S.red_block_end - 1) {
@@ -195,6 +193,7 @@ struct fp8_matmul_base {
         }
     }
 
+    template <bool save_output, bool save_full_col>
     __device__ static inline void consumer_loop(const globals &G, state &S) {
         tm_t tm = S.tm_allocator.allocate<tm_t>(0);
 
@@ -213,14 +212,11 @@ struct fp8_matmul_base {
             if (consumer::laneid() == 0)
                 tma::cluster::arrive(S.outputs_finished, 0, 1); // signal CTA 0
         }
-        
-        if (S.is_tail_row && S.cta_id == 1)
-            return;
+
+        constexpr int num_store_iters = save_output ? (save_full_col ? 2 : 1) : 0;
 
         #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            if (S.is_tail_col && i == 1)
-                break;
+        for (int i = 0; i < num_store_iters; i++) {
             if (S.consumer_id == i) {
                 warpgroup::store(S.outputs.C, C_reg);
                 warpgroup::sync(2 + i);
@@ -253,15 +249,32 @@ struct fp8_matmul_base {
             S.row_block_idx = supergroup_idx * SUPERGROUP_SIZE + row_within_supergroup;
             S.col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
-            S.is_tail_row = S.row_block_idx == num_blocks_per_row - 1 && row_has_tail;
-            S.is_tail_col = S.col_block_idx == num_blocks_per_col - 1 && col_has_tail;
+            const bool is_tail_row = S.row_block_idx == (num_blocks_per_col - 1) && row_has_tail;
+            const bool is_tail_col = S.col_block_idx == (num_blocks_per_row - 1) && col_has_tail;
+            const bool load_A = !is_tail_row || S.cta_id == 0;
+            const bool load_B = !is_tail_col || S.cta_id == 0;
+            const bool save_output = load_A;
+            const bool save_full_col = !is_tail_col;
 
-            if (S.is_input_loader)
-                input_loader_loop(G, S);
-            else if (S.is_launcher)
+            if (S.is_input_loader) {
+                if (load_A && load_B)
+                    input_loader_loop<true, true>(G, S);
+                else if (load_A)
+                    input_loader_loop<true, false>(G, S);
+                else if (load_B)
+                    input_loader_loop<false, true>(G, S);
+                else
+                    input_loader_loop<false, false>(G, S);
+            } else if (S.is_launcher) {
                 launcher_loop(G, S);
-            else if (S.is_consumer)
-                consumer_loop(G, S);
+            } else if (S.is_consumer) {
+                if (save_output && save_full_col)
+                    consumer_loop<true, true>(G, S);
+                else if (save_output)
+                    consumer_loop<true, false>(G, S);
+                else
+                    consumer_loop<false, false>(G, S);
+            }
         }
     }
 
@@ -315,9 +328,6 @@ struct fp8_matmul_base {
             .col_block_idx = 0,
             .red_block_start = 0,
             .red_block_end = 0,
-
-            .is_tail_row = false,
-            .is_tail_col = false,
 
             .inputs = inputs,
             .outputs = outputs,
