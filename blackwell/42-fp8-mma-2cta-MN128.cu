@@ -40,7 +40,7 @@
         ^ + supporting 128 granularity on M & N (this file)
             - 4096x4096x4096 : 1281.16 TFLOp/s
             - 8192x8192x8192 : 2719.50 TFLOp/s
-            - 16384x16384x16384 : 2898.47 TFLOp/s (degraded due to GPU. probably should add about 100 TFLOPs to this)
+            - 16384x16384x16384 : 2912.10 TFLOp/s (degraded due to GPU. probably should add about 70 TFLOPs to this)
             - 204800x2048x1536 : 2486.30 TFLOp/s
 
         ^ + supporting 128 granularity on K
