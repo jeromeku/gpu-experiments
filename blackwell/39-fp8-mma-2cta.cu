@@ -10,9 +10,13 @@
             - 204800x2048x1408 : 3390.25 TFLOPs (but results incorrect, so unsure if accurate measure)
 
         ^ + called from PyTorch (this file)
-            - 
+            - 4096x4096x4096 : 2090.42 TFLOp/s
+            - 8192x8192x8192 : 3200.70 TFLOp/s
+            - 16384x16384x16384 : 3300.45 TFLOp/s
+            - 204800x2048x1536 : 2887.71 TFLOp/s (changed dim for yet supported granularity)
 
         ^ + pipeline factored out
+        ^ + doing 256x128x256 instead of 512x128x256
         ^ + supporting 128 granularity on M
         ^ + supporting 128 granularity on N
         ^ + supporting 128 granularity on K
@@ -53,7 +57,7 @@ struct globals {
     static constexpr int RED_BLOCK = 128; // reduction axis
 
     // Supergrouping for higher L2 utilization
-    static constexpr int SUPERGROUP_SIZE = 12;
+    static constexpr int SUPERGROUP_SIZE = 8;
 
     using A_tile = st_fp8e4m3<ROW_BLOCK / 4, RED_BLOCK>; // WG/CTA distributed
     using B_tile = st_fp8e4m3<COL_BLOCK / 2, RED_BLOCK>; // CTA distributed
@@ -119,6 +123,7 @@ void kernel(const __grid_constant__ globals G) {
 
     // Set up pipeline parameters
     uint32_t stage = 0;
+    uint32_t last_stage = globals::PIPELINE_STAGES;
     uint32_t phasebits = 0xFFFF'0000;
     const int lane_id = warp::laneid();
     const int warp_id = warpgroup::warpid();
@@ -139,80 +144,105 @@ void kernel(const __grid_constant__ globals G) {
 
         if (warp_id == 3 && lane_id == 0) {
             // Load input matrices
-            // for (int block_idx = blockIdx.x; block_idx < num_blocks; block_idx += gridDim.x) {
-                // int supergroup_idx = block_idx / num_blocks_per_supergroup;
-                // int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
-                // int rows_in_supergroup = min(globals::SUPERGROUP_SIZE, num_blocks_per_col - supergroup_idx * globals::SUPERGROUP_SIZE);
-                // int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
-                // int row_block_idx = supergroup_idx * globals::SUPERGROUP_SIZE + row_within_supergroup;
-                // int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                int rows_in_supergroup = min(globals::SUPERGROUP_SIZE, num_blocks_per_col - supergroup_idx * globals::SUPERGROUP_SIZE);
+                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                int row_block_idx = supergroup_idx * globals::SUPERGROUP_SIZE + row_within_supergroup;
+                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
                 
-                int row_block_idx = 0;
-                int col_block_idx = 0;
-                int red_block_idx = 0;
+                for (int red_block_idx = 0; red_block_idx < num_iters; red_block_idx++) {
+                    tma::cluster::wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    update_phasebit<1>(phasebits, stage);
+    
+                    if (stage == last_stage) {
+                        arrive(outputs_arrived);
+                        last_stage = globals::PIPELINE_STAGES;
+                    }
 
-                // Load to current CTA, but signal mbarrier at CTA 0 (tma::cluster is purely for cluster-level synchronization)
-                tma::cluster::expect_bytes(inputs_arrived[stage], sizeof(globals::pipeline_inputs), 0);
-                warp::tma::cluster::load_async(inputs[stage].A[0], G.A, {row_block_idx * 4 + cta_id * 2 + 0, red_block_idx}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0); 
-                warp::tma::cluster::load_async(inputs[stage].A[1], G.A, {row_block_idx * 4 + cta_id * 2 + 1, red_block_idx}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
-                warp::tma::cluster::load_async(inputs[stage].B,    G.B, {col_block_idx * 2 + cta_id,         red_block_idx}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
+                    // Load to current CTA, but signal mbarrier at CTA 0 (tma::cluster is purely for cluster-level synchronization)
+                    tma::cluster::expect_bytes(inputs_arrived[stage], sizeof(globals::pipeline_inputs), 0);
+                    warp::tma::cluster::load_async(inputs[stage].A[0], G.A, {row_block_idx * 4 + cta_id * 2 + 0, red_block_idx}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0); 
+                    warp::tma::cluster::load_async(inputs[stage].A[1], G.A, {row_block_idx * 4 + cta_id * 2 + 1, red_block_idx}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
+                    warp::tma::cluster::load_async(inputs[stage].B,    G.B, {col_block_idx * 2 + cta_id,         red_block_idx}, inputs_arrived[stage], (uint16_t)(1 << cta_id), 0);
+    
+                    if (red_block_idx == num_iters - 1) {
+                        last_stage = stage;
+                    }
 
-
-                //TODO delete & FIX TO <1>
-                tma::cluster::wait(inputs_finished[stage], get_phasebit<0>(phasebits, stage));
-                update_phasebit<0>(phasebits, stage);
+                    // Update stage
+                    stage = (stage + 1) % globals::PIPELINE_STAGES;
+                }
+            }
+            if (last_stage < globals::PIPELINE_STAGES) {
+                tma::cluster::wait(inputs_finished[last_stage], get_phasebit<1>(phasebits, last_stage));
                 arrive(outputs_arrived);
-
-                // Update stage
-                stage = (stage + 1) % globals::PIPELINE_STAGES;
-            // }
-        } else if (cta_id == 0 && warp_id <= 1 && lane_id == 0) { // idea: why not change this to per-cta, to save warps?
+            }
+        } else if (cta_id == 0 && warp_id <= 1 && lane_id == 0) {
             // Launch tensor core matrix multiply
             tm_t tm = tm_allocator.allocate<tm_t>(warp_id * globals::COL_BLOCK);
-            tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
-            update_phasebit<0>(phasebits, stage);
-            mm2_ABt(tm, inputs[stage].A[warp_id], inputs[stage].B, inputs_finished[stage]);
 
-            // Update stage
-            stage = (stage + 1) % globals::PIPELINE_STAGES;
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {                
+                for (int red_block_idx = 0; red_block_idx < num_iters; red_block_idx++) {
+                    if (red_block_idx == 0) {
+                        tma::cluster::wait(outputs_finished[warp_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                        update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
+                    }
+                    tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    update_phasebit<0>(phasebits, stage);
+                    if (red_block_idx == 0)
+                        mm2_ABt(tm, inputs[stage].A[warp_id], inputs[stage].B, inputs_finished[stage]);
+                    else
+                        mma2_ABt(tm, inputs[stage].A[warp_id], inputs[stage].B, inputs_finished[stage]);
+                    stage = (stage + 1) % globals::PIPELINE_STAGES;
+                }
+            }
         }
     } else {
         // Consumer group
         warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
         tm_t tm = tm_allocator.allocate<tm_t>(warpgroup_id * globals::COL_BLOCK);
 
-        // Wait for the matmul to complete
-        wait(outputs_arrived, get_phasebit<0>(phasebits, stage));
+        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / config::CLUSTER_SIZE) {
+            int supergroup_idx = block_idx / num_blocks_per_supergroup;
+            int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+            int rows_in_supergroup = min(globals::SUPERGROUP_SIZE, num_blocks_per_col - supergroup_idx * globals::SUPERGROUP_SIZE);
+            int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+            int row_block_idx = supergroup_idx * globals::SUPERGROUP_SIZE + row_within_supergroup;
+            int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
-        // Load the output from tensor memory into registers
-        rt_hf<globals::ROW_BLOCK / 16, globals::COL_BLOCK / 4> C_reg[4];
-        #pragma unroll
-        for (int i = 0; i < 4; i++)
-            warpgroup::load_async(C_reg[i], tm.subtile<tt<float, globals::ROW_BLOCK / 4, globals::COL_BLOCK / 4>>(0, i * globals::COL_BLOCK / 4));
-        tensor_load_wait();
-        warpgroup::sync(2 + warpgroup_id);
-        if (warpgroup::laneid() == 0)
-            tma::cluster::arrive(outputs_finished[warpgroup_id], 0, 1); // signal CTA 0
+            // Wait for the matmul to complete
+            wait(outputs_arrived, get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+            update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
 
-        #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            if (warpgroup::groupid() == i) {
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    warpgroup::store(outputs.C, C_reg[j]);
-                    warpgroup::sync(2 + warpgroup_id);
-                    if (warpgroup::laneid() == 0) {
-                        tma::store_async(G.C, outputs.C, {cta_id * 2 + i, j});
-                        tma::store_async_read_wait();
+            // Load the output from tensor memory into registers
+            rt_hf<globals::ROW_BLOCK / 16, globals::COL_BLOCK / 4> C_reg[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                warpgroup::load_async(C_reg[i], tm.subtile<tt<float, globals::ROW_BLOCK / 4, globals::COL_BLOCK / 4>>(0, i * globals::COL_BLOCK / 4));
+            tensor_load_wait();
+            warpgroup::sync(2 + warpgroup_id);
+            if (warpgroup::laneid() == 0)
+                tma::cluster::arrive(outputs_finished[warpgroup_id], 0, 1); // signal CTA 0
+
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                if (warpgroup::groupid() == i) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        warpgroup::store(outputs.C, C_reg[j]);
+                        warpgroup::sync(2 + warpgroup_id);
+                        if (warpgroup::laneid() == 0) {
+                            tma::store_async(G.C, outputs.C, {row_block_idx * 4 + cta_id * 2 + i, col_block_idx * 4 + j});
+                            tma::store_async_read_wait();
+                        }
+                        warpgroup::sync(2 + warpgroup_id);
                     }
-                    if (j < 3) warpgroup::sync(2 + warpgroup_id);
                 }
+                consumer::sync(1);
             }
-            consumer::sync(1);
         }
-
-        // Update stage
-        stage = (stage + 1) % globals::PIPELINE_STAGES;
     }
 
     everyone::tma::cluster::sync(); // for tm_allocator destructor
