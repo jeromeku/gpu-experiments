@@ -67,11 +67,11 @@ struct globals {
 
     using A_tile = st_fp8e4m3<ROW_BLOCK / 4, RED_BLOCK>; // WG/CTA distributed
     using B_tile = st_fp8e4m3<COL_BLOCK / 2, RED_BLOCK>; // CTA distributed
-    using C_tile = st_hf<ROW_BLOCK / 4, COL_BLOCK / 4>; // WG/CTA distributed + array-divided
+    using C_tile = st_bf<ROW_BLOCK / 4, COL_BLOCK / 4>; // WG/CTA distributed + array-divided
 
     using A_gl = gl<fp8e4m3, 1, 1, -1, -1, A_tile>;
     using B_gl = gl<fp8e4m3, 1, 1, -1, -1, B_tile>;
-    using C_gl = gl<half,    1, 1, -1, -1, C_tile>;
+    using C_gl = gl<bf16,    1, 1, -1, -1, C_tile>;
 
     A_gl A;
     B_gl B;
@@ -220,7 +220,7 @@ void kernel(const __grid_constant__ globals G) {
             update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
 
             // Load the output from tensor memory into registers
-            rt_hf<globals::ROW_BLOCK / 16, globals::COL_BLOCK / 4> C_reg[4];
+            rt_bf<globals::ROW_BLOCK / 16, globals::COL_BLOCK / 4> C_reg[4];
             #pragma unroll
             for (int i = 0; i < 4; i++)
                 warpgroup::load_async(C_reg[i], tm.subtile<tt<float, globals::ROW_BLOCK / 4, globals::COL_BLOCK / 4>>(0, i * globals::COL_BLOCK / 4));
