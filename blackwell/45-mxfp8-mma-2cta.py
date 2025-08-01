@@ -91,14 +91,14 @@ def reshape_sc(A_sc: torch.Tensor) -> torch.Tensor:
 
 
 # Matrix dimensions (should not change)
-M = 256
-K = 128
-N = 256
+M = 16384
+K = 16384
+N = 16384
 
 # Generate random matrices
-A = torch.randn(M, K, dtype=torch.float32, device="cuda:0") / K ** 0.25
-B = torch.randn(N, K, dtype=torch.float32, device="cuda:0") / K ** 0.25
-C = torch.zeros(M, N, dtype=torch.float32, device="cuda:0")
+A = torch.randn(M, K, dtype=torch.float32, device="cuda") / K ** 0.25
+B = torch.randn(N, K, dtype=torch.float32, device="cuda") / K ** 0.25
+C = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
 
 # Quantize matrices
 A_fp8, _A_sc = quantize_2d(A)
@@ -125,7 +125,7 @@ kernel(A_fp8, A_sc, B_fp8, B_sc, C)
 torch.cuda.synchronize()
 
 # Check correctness
-C_ref = torch.matmul(A, B.T)
+C_ref = torch.matmul(A, B.T).to(torch.bfloat16)
 assert C_ref.dtype == C.dtype
 abs_diff = torch.abs(C_ref - C)
 bias = (C - C_ref).mean().item()
@@ -136,7 +136,7 @@ print("Mean diff:", bias)
 print("Mean ref:", mean_ref)
 
 # Check correctness of dequantized matmul. This should have an exact match
-C_deq_ref = torch.matmul(A_deq, B_deq.T)
+C_deq_ref = torch.matmul(A_deq, B_deq.T).to(torch.bfloat16)
 assert C_deq_ref.dtype == C.dtype
 abs_diff = torch.abs(C_deq_ref - C)
 print('Max adiff:', abs_diff.max().item())

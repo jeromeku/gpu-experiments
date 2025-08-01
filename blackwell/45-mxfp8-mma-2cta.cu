@@ -1,3 +1,11 @@
+/*
+    Benchmarks:
+        - 4096x4096x4096 : 1236.21 TFLOp/s
+        - 8192x8192x8192 : 2558.32 TFLOp/s
+        - 16384x16384x16384 : 2700.41 TFLOp/s
+        - 204800x2048x1536 : 2307.49 TFLOp/s
+*/
+
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "pyutils/pyutils.cuh"
@@ -30,7 +38,7 @@ struct globals {
     static constexpr int ROW_BLOCK = 256;
     static constexpr int COL_BLOCK = 256;
     static constexpr int REDUCTION_BLOCK = 128;
-    static constexpr int SCALE_BLOCK = 512; // 4 K=32-blocks per 128 rows/cols per CTA
+    static constexpr int SCALE_BLOCK = 512; // 4 K=32-blocks per 128 rows per CTA
 
     using A_fp8_tile = st_fp8e4m3<ROW_BLOCK / 2, REDUCTION_BLOCK>; // CTA distributed
     using A_sc_vec = sv<fp8e8m0, SCALE_BLOCK>;
@@ -94,19 +102,21 @@ void kernel(const __grid_constant__ globals G) {
 
     // Set up mbarriers
     __shared__ semaphore inputs_arrived[globals::PIPELINE_STAGES];
-    __shared__ semaphore inputs_finished[globals::PIPELINE_STAGES];
-    __shared__ semaphore scales_arrived[globals::PIPELINE_STAGES];
-    __shared__ semaphore tensors_finished;
+    __shared__ semaphore scales_sm_arrived[globals::PIPELINE_STAGES];
+    __shared__ semaphore scales_tm_arrived[globals::PIPELINE_STAGES];
+    __shared__ semaphore matmul_finished[globals::PIPELINE_STAGES];
+    __shared__ semaphore tensor_finished;
     __shared__ semaphore outputs_arrived;
     if (threadIdx.x == 32) {
         #pragma unroll
         for (int i = 0; i < globals::PIPELINE_STAGES; ++i) {
-            init_semaphore(inputs_arrived[i], 0, 4); // (tiles + scales) * 2 CTAs
-            init_semaphore(inputs_finished[i], 0, 1);
-            init_semaphore(scales_arrived[i], 0, 1);
+            init_semaphore(inputs_arrived[i], 0, config::CLUSTER_SIZE);
+            init_semaphore(scales_sm_arrived[i], 0, 1); // local
+            init_semaphore(scales_tm_arrived[i], 0, config::CLUSTER_SIZE);
+            init_semaphore(matmul_finished[i], 0, 1); // odd CTA
         }
-        init_semaphore(tensors_finished, 0, 2); // 2 CTAs
-        init_semaphore(outputs_arrived, 0, 1);
+        init_semaphore(tensor_finished, 0, config::CLUSTER_SIZE);
+        init_semaphore(outputs_arrived, 0, 1); // local
     }
     asm volatile("{barrier.cluster.arrive.release.aligned;}");
     asm volatile("{barrier.cluster.wait.acquire.aligned;}");
@@ -146,7 +156,7 @@ void kernel(const __grid_constant__ globals G) {
             if (warp_id == 3 && lane_id == 0) {
                 // Load input matrices to shared memory
                 for (int i = 0; i < num_iters_per_block; ++i) {
-                    tma::cluster::wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    tma::cluster::wait(matmul_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
 
                     if (stage == last_stage) {
@@ -168,20 +178,20 @@ void kernel(const __grid_constant__ globals G) {
             } else if (warp_id == 2 && lane_id == 0) {
                 // Load scale matrices to shared memory
                 for (int i = 0; i < num_iters_per_block; ++i) {
-                    tma::cluster::wait(inputs_arrived[stage], get_phasebit<1>(phasebits, stage));
+                    tma::cluster::wait(scales_tm_arrived[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
-                    tma::expect_bytes(scales_arrived[stage], sizeof(globals::A_sc_vec) + sizeof(globals::B_sc_vec) * 2);
-                    tma::load_async(input_scales[stage].A, G.A_sc, {row_block_idx * 2 + cta_id, i, 0}, scales_arrived[stage]);
-                    tma::load_async(input_scales[stage].B[0], G.B_sc, {col_block_idx * 2 + 0, i, 0}, scales_arrived[stage]);
-                    tma::load_async(input_scales[stage].B[1], G.B_sc, {col_block_idx * 2 + 1, i, 0}, scales_arrived[stage]);
+                    tma::expect_bytes(scales_sm_arrived[stage], sizeof(globals::A_sc_vec) + sizeof(globals::B_sc_vec) * 2);
+                    tma::load_async(input_scales[stage].A, G.A_sc, {row_block_idx * 2 + cta_id, i, 0}, scales_sm_arrived[stage]);
+                    tma::load_async(input_scales[stage].B[0], G.B_sc, {col_block_idx * 2 + 0, i, 0}, scales_sm_arrived[stage]);
+                    tma::load_async(input_scales[stage].B[1], G.B_sc, {col_block_idx * 2 + 1, i, 0}, scales_sm_arrived[stage]);
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
             } else if (warp_id == 1 && lane_id == 0) {
                 // Load scale matrices to tensor memory
                 for (int i = 0; i < num_iters_per_block; i++) {
-                    wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    wait(scales_sm_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
-                    tma::cluster::wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    tma::cluster::wait(matmul_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
                     uint64_t A_sc_addr = reinterpret_cast<uint64_t>(__cvta_generic_to_shared(&input_scales[stage].A));
                     uint64_t A_sc_desc = 
@@ -217,16 +227,17 @@ void kernel(const __grid_constant__ globals G) {
                     asm volatile("{tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;}"
                         :: "r"(B_sc_tm_addr + stage * 16 + 4 * 1), "l"(B_sc_desc[1]));
                     asm volatile("{tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;}"
-                        :: "l"(__cvta_generic_to_shared(&inputs_arrived[stage])), "h"((uint16_t)(0b01))); // signal CTA 0 only
+                        :: "l"(__cvta_generic_to_shared(&scales_tm_arrived[stage])), "h"((uint16_t)(0b11))); // signal both CTAs
                     asm volatile("{tcgen05.fence::before_thread_sync;}");
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
             } else if (cta_id == 0 && warp_id == 0 && lane_id == 0) {
                 // Launch tensor core matrix multiply
-                tma::cluster::wait(tensors_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                tma::cluster::wait(tensor_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
                 update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
                 for (int i = 0; i < num_iters_per_block; i++) {
                     tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    tma::cluster::wait(scales_tm_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
                     constexpr uint64_t M = globals::ROW_BLOCK;
                     constexpr uint64_t N = globals::COL_BLOCK;
@@ -284,13 +295,13 @@ void kernel(const __grid_constant__ globals G) {
                                         "r"(I_descs[i]),
                                         "n"(1));
                     }
-                    kittens::detail::tcgen05::commit<config::CLUSTER_SIZE>(inputs_finished[stage]);
+                    kittens::detail::tcgen05::commit<config::CLUSTER_SIZE>(matmul_finished[stage]);
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
             }
         }
         if (warp_id == 3 && lane_id == 0 && last_stage < globals::PIPELINE_STAGES) {
-            tma::cluster::wait(inputs_finished[last_stage], get_phasebit<1>(phasebits, last_stage));
+            tma::cluster::wait(matmul_finished[last_stage], get_phasebit<1>(phasebits, last_stage));
             arrive(outputs_arrived);
         }
     } else {
@@ -318,7 +329,7 @@ void kernel(const __grid_constant__ globals G) {
             tensor_load_wait();
             consumer::sync(1);
             if (consumer::laneid() == 0)
-                tma::cluster::arrive(tensors_finished, 0, 1); // signal CTA 0
+                tma::cluster::arrive(tensor_finished, 0, 1); // signal CTA 0
 
             #pragma unroll
             for (int i = 0; i < 2; i++) {
