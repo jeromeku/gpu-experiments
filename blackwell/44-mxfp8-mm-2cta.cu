@@ -83,17 +83,11 @@ void kernel(const __grid_constant__ globals G) {
 
     // Allocate tensor memory
     __shared__ uint32_t tm_addr_shared;
-    uint32_t tm_addr = 0;
     if (warpid() == 0) {
         asm volatile("{tcgen05.alloc.cta_group::2.sync.aligned.b32 [%0], %1;}"
             :: "l"(reinterpret_cast<uint64_t>(&tm_addr_shared)), "n"(512)); // assign max
         asm volatile("{tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;}");
     }
-    __syncthreads();
-    tm_addr = tm_addr_shared;
-    uint32_t out_tm_addr = tm_addr;
-    uint32_t A_sc_tm_addr = tm_addr + 256;
-    uint32_t B_sc_tm_addr = tm_addr + 256 + 128;
 
     // Set up mbarriers
     __shared__ semaphore inputs_arrived;
@@ -106,6 +100,12 @@ void kernel(const __grid_constant__ globals G) {
     }
     asm volatile("{barrier.cluster.arrive.release.aligned;}");
     asm volatile("{barrier.cluster.wait.acquire.aligned;}");
+
+    // Set tensor memory addresses
+    uint32_t tm_addr = tm_addr_shared;
+    uint32_t out_tm_addr = tm_addr;
+    uint32_t A_sc_tm_addr = tm_addr + 256;
+    uint32_t B_sc_tm_addr = tm_addr + 256 + 128;
 
     // Main divergence
     if (warpgroup_id == config::NUM_WARPGROUPS - 1) {
