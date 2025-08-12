@@ -44,7 +44,8 @@
 # SRC := 44-mxfp8-mm-2cta.cu
 # SRC := 45-mxfp8-mma-2cta.cu
 # SRC := 46-mxfp8-mma-2cta-MNK128.cu
-SRC := 47-mxfp8-mma-2cta-MNK128-polished.cu
+# SRC := 47-mxfp8-mma-2cta-MNK128-polished.cu
+SRC := 48-bf16-mha.cu
 
 # Compiler configuration
 NVCC := nvcc
