@@ -222,7 +222,7 @@ static void kernel(const __grid_constant__ globals G) {
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
             }
-        } else if (cta_id == 0 && warp_id == 2 && lane_id < 2) {
+        } else if (cta_id == 0 && warp_id == 2 && lane_id == 0) {
             // QK launcher
             for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
                 globals::task_info task_info = get_task_info(G, task_idx);
@@ -234,15 +234,18 @@ static void kernel(const __grid_constant__ globals G) {
                 for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
                     tma::cluster::wait(K_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
-                    tma::cluster::wait(A_unloaded[lane_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
-                    update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
 
-                    mm2_ABt(QK_tm[lane_id], Q_smem[lane_id], K_smem[stage], QK_finished[lane_id]);
+                    #pragma unroll
+                    for (int consumer_id = 0; consumer_id < config::NUM_CONSUMERS; ++consumer_id) {
+                        tma::cluster::wait(A_unloaded[consumer_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES + consumer_id));
+                        update_phasebit<1>(phasebits, globals::PIPELINE_STAGES + consumer_id);
+                        mm2_ABt(QK_tm[consumer_id], Q_smem[consumer_id], K_smem[stage], QK_finished[consumer_id]);
+                    }
 
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
             }
-        } else if (cta_id == 0 && warp_id == 3 && lane_id < 2) {
+        } else if (cta_id == 0 && warp_id == 3 && lane_id == 0) {
             // AV launcher
             for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
                 globals::task_info task_info = get_task_info(G, task_idx);
@@ -251,10 +254,13 @@ static void kernel(const __grid_constant__ globals G) {
                 for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
                     tma::cluster::wait(V_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
-                    tma::cluster::wait(A_loaded[lane_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
-                    update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
 
-                    mma2_AB(AV_tm[lane_id], A_smem[lane_id], V_smem[stage], AV_finished[lane_id]);
+                    #pragma unroll
+                    for (int consumer_id = 0; consumer_id < config::NUM_CONSUMERS; ++consumer_id) {
+                        tma::cluster::wait(A_loaded[consumer_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES + consumer_id));
+                        update_phasebit<0>(phasebits, globals::PIPELINE_STAGES + consumer_id);
+                        mma2_AB(AV_tm[consumer_id], A_smem[consumer_id], V_smem[stage], AV_finished[consumer_id]);
+                    }
 
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }

@@ -38,18 +38,18 @@ K_grad = torch.zeros_like(K,       dtype=torch.float,    device='cuda')
 V_grad = torch.zeros_like(V,       dtype=torch.float,    device='cuda')
 O_grad = torch.ones_like(O,        dtype=torch.bfloat16, device='cuda')
 
-# Run forward kernel
-print("\nRunning forward kernel...")
-bf16_attn_fwd(Q, K, V, L, O)
-torch.cuda.synchronize()
-
-# Run backward kernel
-print("\nRunning backward kernel...")
-bwd_attend_prep_ker_128(O_grad, O, D_vec)
-bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
-torch.cuda.synchronize()
-
 if CHECK_CORRECTNESS:
+    # Run forward kernel
+    print("\nRunning forward kernel...")
+    bf16_attn_fwd(Q, K, V, L, O)
+    torch.cuda.synchronize()
+
+    # Run backward kernel
+    print("\nRunning backward kernel...")
+    bwd_attend_prep_ker_128(O_grad, O, D_vec)
+    bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
+    torch.cuda.synchronize()
+
     # Run forward reference
     Q.requires_grad = True
     K.requires_grad = True
@@ -91,12 +91,14 @@ NUM_ITERS = 10
 start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 
+print("\nBenchmarking forward pass...")
+
 for i in range(NUM_WARMUPS):
-    fwd_attend_ker_128_noncausal(Q, K, V, L, O)
+    bf16_attn_fwd(Q, K, V, L, O)
 
 for i in range(NUM_ITERS):
     start_events[i].record()
-    fwd_attend_ker_128_noncausal(Q, K, V, L, O)
+    bf16_attn_fwd(Q, K, V, L, O)
     end_events[i].record()
 torch.cuda.synchronize()
 
@@ -106,9 +108,10 @@ std_time = np.std(times) * 1e-3
 flops = 4 * B * H * N * N * D
 tflops = flops * 1e-12
 
-print("\nForward")
 print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
 print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
+
+print("\nBenchmarking backward pass...")
 
 for i in range(NUM_WARMUPS):
     bwd_attend_prep_ker_128(O_grad, O, D_vec)
@@ -128,6 +131,5 @@ std_time = np.std(times) * 1e-3
 flops = 2.5 * 4 * B * H * N * N * D
 tflops = flops * 1e-12
 
-print("\nBackward")
 print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
 print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
