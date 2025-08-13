@@ -3,7 +3,7 @@ import torch
 torch.manual_seed(42)
 
 # Import our Python bindings
-from _C import fwd_attend_ker_128_noncausal, bwd_attend_prep_ker_128, bwd_attend_ker_128_noncausal
+from _C import bf16_attn_fwd, fwd_attend_ker_128_noncausal, bwd_attend_prep_ker_128, bwd_attend_ker_128_noncausal
 
 
 def check_diff(name, A, A_ref):
@@ -22,6 +22,9 @@ N = 1536
 H = 1
 D = 128
 
+# Flag
+CHECK_CORRECTNESS = True
+
 # Input tensors
 print('Generating inputs...')
 Q =      torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')
@@ -37,36 +40,8 @@ O_grad = torch.ones_like(O,        dtype=torch.bfloat16, device='cuda')
 
 # Run forward kernel
 print("\nRunning forward kernel...")
-fwd_attend_ker_128_noncausal(Q, K, V, L, O)
+bf16_attn_fwd(Q, K, V, L, O)
 torch.cuda.synchronize()
-
-# Run forward reference
-Q.requires_grad = True
-K.requires_grad = True
-V.requires_grad = True
-scores = torch.matmul(Q, K.transpose(-2, -1)) / (D ** 0.5)
-attn = torch.softmax(scores, dim=-1)
-O_ref = torch.matmul(attn, V)
-
-# Check forward pass
-check_diff("O", O, O_ref)
-
-# Run backward reference
-O_ref.backward(O_grad)
-Q_grad_ref = Q.grad.detach()
-K_grad_ref = K.grad.detach()
-V_grad_ref = V.grad.detach()
-D_vec_ref = (O * O_grad).sum(dim=-1).unsqueeze(2)
-
-# Run backward Pytorch
-V_grad_torch = torch.matmul(attn.transpose(-2, -1), O_grad) # dL/dV = attn^T @ dL/dO
-attn_grad = torch.matmul(O_grad, V.transpose(-2, -1)) # dL/d(attn) = dL/dO @ V^T
-scores_grad = (attn_grad * attn - attn * (attn_grad * attn).sum(dim=-1, keepdim=True)) / (D ** 0.5)
-Q_grad_torch = torch.matmul(scores_grad, K) # dL/dQ = dL/d(scores) @ K
-K_grad_torch = torch.matmul(scores_grad.transpose(-2, -1), Q) # dL/dK = dL/d(scores)^T @ Q
-check_diff("Q_grad_torch", Q_grad_torch, Q_grad_ref)
-check_diff("K_grad_torch", K_grad_torch, K_grad_ref)
-check_diff("V_grad_torch", V_grad_torch, V_grad_ref)
 
 # Run backward kernel
 print("\nRunning backward kernel...")
@@ -74,11 +49,40 @@ bwd_attend_prep_ker_128(O_grad, O, D_vec)
 bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
 torch.cuda.synchronize()
 
-# Check backward pass
-check_diff("D_vec", D_vec, D_vec_ref)
-check_diff("Q_grad", Q_grad, Q_grad_ref)
-check_diff("K_grad", K_grad, K_grad_ref)
-check_diff("V_grad", V_grad, V_grad_ref)
+if CHECK_CORRECTNESS:
+    # Run forward reference
+    Q.requires_grad = True
+    K.requires_grad = True
+    V.requires_grad = True
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (D ** 0.5)
+    attn = torch.softmax(scores, dim=-1)
+    O_ref = torch.matmul(attn, V)
+
+    # Check forward pass
+    check_diff("O", O, O_ref)
+
+    # Run backward reference
+    O_ref.backward(O_grad)
+    Q_grad_ref = Q.grad.detach()
+    K_grad_ref = K.grad.detach()
+    V_grad_ref = V.grad.detach()
+    D_vec_ref = (O * O_grad).sum(dim=-1).unsqueeze(2)
+
+    # Run backward Pytorch
+    V_grad_torch = torch.matmul(attn.transpose(-2, -1), O_grad) # dL/dV = attn^T @ dL/dO
+    attn_grad = torch.matmul(O_grad, V.transpose(-2, -1)) # dL/d(attn) = dL/dO @ V^T
+    scores_grad = (attn_grad * attn - attn * (attn_grad * attn).sum(dim=-1, keepdim=True)) / (D ** 0.5)
+    Q_grad_torch = torch.matmul(scores_grad, K) # dL/dQ = dL/d(scores) @ K
+    K_grad_torch = torch.matmul(scores_grad.transpose(-2, -1), Q) # dL/dK = dL/d(scores)^T @ Q
+    check_diff("Q_grad_torch", Q_grad_torch, Q_grad_ref)
+    check_diff("K_grad_torch", K_grad_torch, K_grad_ref)
+    check_diff("V_grad_torch", V_grad_torch, V_grad_ref)
+
+    # Check backward pass
+    check_diff("D_vec", D_vec, D_vec_ref)
+    check_diff("Q_grad", Q_grad, Q_grad_ref)
+    check_diff("K_grad", K_grad, K_grad_ref)
+    check_diff("V_grad", V_grad, V_grad_ref)
 
 # Benchmark
 NUM_WARMUPS = 5
