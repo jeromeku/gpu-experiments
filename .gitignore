@@ -12,3 +12,4 @@ gmon.out
 .DS_Store
 *.out
 *.so
+*.png
