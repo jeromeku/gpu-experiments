@@ -3,7 +3,7 @@ import torch
 torch.manual_seed(42)
 
 # Import our Python bindings
-from _C import bf16_attn_fwd, fwd_attend_ker_128_noncausal, bwd_attend_prep_ker_128, bwd_attend_ker_128_noncausal
+from _C import bf16_attn_fwd, bf16_attn_bwd_prep, bwd_attend_ker_128_noncausal
 
 
 def check_diff(name, A, A_ref):
@@ -19,12 +19,12 @@ def check_diff(name, A, A_ref):
 # Input dimensions
 B = 1
 N = 2048
-H = 128
+H = 1
 D = 128
 
 # Flag
 CHECK_CORRECTNESS = True
-BENCHMARK = True
+BENCHMARK = False
 
 # Input tensors
 print('Generating inputs...')
@@ -47,7 +47,7 @@ if CHECK_CORRECTNESS:
 
     # Run backward kernel
     print("\nRunning backward kernel...")
-    bwd_attend_prep_ker_128(O_grad, O, D_vec)
+    bf16_attn_bwd_prep(O_grad, O, D_vec)
     bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
     torch.cuda.synchronize()
 
@@ -112,16 +112,36 @@ if BENCHMARK:
     print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
     print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
 
+    print("\nBenchmarking backward prep...")
+
+    for i in range(NUM_WARMUPS):
+        bf16_attn_bwd_prep(O_grad, O, D_vec)
+        torch.cuda.synchronize()
+
+    for i in range(NUM_ITERS):
+        start_events[i].record()
+        bf16_attn_bwd_prep(O_grad, O, D_vec)
+        end_events[i].record()
+    torch.cuda.synchronize()
+
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    avg_time = np.mean(times) * 1e-3
+    std_time = np.std(times) * 1e-3
+    gb = B * H * N * (D * 2 * 2 + 4) * 1e-9
+
+    print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
+    print(f'GB/s: {gb / avg_time:.2f} GB/s')
+
     print("\nBenchmarking backward pass...")
 
     for i in range(NUM_WARMUPS):
-        bwd_attend_prep_ker_128(O_grad, O, D_vec)
+        bf16_attn_bwd_prep(O_grad, O, D_vec)
         bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
         torch.cuda.synchronize()
 
     for i in range(NUM_ITERS):
         start_events[i].record()
-        bwd_attend_prep_ker_128(O_grad, O, D_vec)
+        bf16_attn_bwd_prep(O_grad, O, D_vec)
         bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
         end_events[i].record()
     torch.cuda.synchronize()

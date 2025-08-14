@@ -385,6 +385,86 @@ static void kernel(const __grid_constant__ globals G) {
 
 } // namespace bf16_attn_fwd
 
+namespace bf16_attn_bwd_prep {
+
+struct config {
+    static constexpr int CLUSTER_SIZE = 1;
+    static constexpr int STATIC_SHARED_MEMORY = 1024;
+    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
+    static constexpr int NUM_THREADS = 128;
+};
+
+struct globals {
+    static constexpr int BLOCK_SIZE = 128;
+    static constexpr int VO_DIM = 128;
+
+    using O_grad_tile = st_bf<BLOCK_SIZE, VO_DIM>;
+    using O_tile = st_bf<BLOCK_SIZE, VO_DIM>;
+    using D_tile = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>;
+
+    using O_grad_gl = gl<bf16, -1, -1, -1, -1, O_grad_tile>;
+    using O_gl = gl<bf16, -1, -1, -1, -1, O_tile>;
+    using D_gl = gl<float, -1, -1, -1, -1, D_tile>;
+
+    O_grad_gl O_grad;
+    O_gl O;
+    D_gl D;
+
+    __host__ inline int dynamic_shared_memory() { return sizeof(O_grad_tile) + sizeof(O_tile) + sizeof(D_tile) + 1024; }
+    __host__ inline dim3 grid()  { return dim3(O_grad.rows() / BLOCK_SIZE, O_grad.depth(), O_grad.batch()); }
+    __host__ inline dim3 block() { return dim3(config::NUM_THREADS); }
+};
+
+__global__ __launch_bounds__(config::NUM_THREADS, 1)
+void kernel(const __grid_constant__ globals G) {
+    // Declare shared memory
+    extern __shared__ int __shm[]; 
+    tma_swizzle_allocator sm_allocator((int*)&__shm[0]);
+
+    // Allocate shared memory
+    globals::O_grad_tile &O_grad_smem = sm_allocator.allocate<globals::O_grad_tile>();
+    globals::O_tile &O_smem = sm_allocator.allocate<globals::O_tile>();
+    globals::D_tile &D_smem = sm_allocator.allocate<globals::D_tile>();
+
+    // Retrieve indices
+    int batch_idx = blockIdx.z;
+    int head_idx = blockIdx.y;
+    int seq_block_idx = blockIdx.x;
+
+    // Set up mbarriers
+    __shared__ semaphore inputs_arrived;
+    if (threadIdx.x == 0) {
+        init_semaphore(inputs_arrived, 0, 1);
+        tma::expect_bytes(inputs_arrived, sizeof(globals::O_grad_tile) + sizeof(globals::O_tile));
+        tma::load_async(O_grad_smem, G.O_grad, {batch_idx, head_idx, seq_block_idx, 0}, inputs_arrived);
+        tma::load_async(O_smem, G.O, {batch_idx, head_idx, seq_block_idx, 0}, inputs_arrived);
+    }
+    __syncthreads();
+
+    // Wait and load
+    rt_fl<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::VO_DIM> O_grad_reg;
+    rt_fl<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::VO_DIM> O_reg;
+    wait(inputs_arrived, 0);
+    warpgroup::load(O_grad_reg, O_grad_smem);
+    warpgroup::load(O_reg, O_smem);
+
+    // Compute
+    col_vec<rt_fl<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::VO_DIM>> D_reg;
+    warp::mul(O_grad_reg, O_grad_reg, O_reg);
+    warp::row_sum(D_reg, O_grad_reg, D_reg);
+
+    // Store to SM
+    warpgroup::store(D_smem, D_reg);
+    __syncthreads();
+
+    // Store to GMEM
+    if (threadIdx.x == 0) {
+        tma::store_async(G.D, D_smem, {batch_idx, head_idx, 0, seq_block_idx});
+    }
+}
+
+} // namespace bf16_attn_bwd_prep
+
 constexpr int NUM_CONSUMERS = (2); 
 constexpr int WARPGROUPS_PER_CONSUMER = (2);
 constexpr int NUM_PRODUCERS = (1);
@@ -1275,6 +1355,11 @@ PYBIND11_MODULE(_C, m) {
         &bf16_attn_fwd::globals::V,
         &bf16_attn_fwd::globals::L,
         &bf16_attn_fwd::globals::O
+    );
+    py::bind_kernel<bf16_attn_bwd_prep::kernel>(m, "bf16_attn_bwd_prep",
+        &bf16_attn_bwd_prep::globals::O_grad,
+        &bf16_attn_bwd_prep::globals::O,
+        &bf16_attn_bwd_prep::globals::D
     );
     py::bind_kernel<fwd_attend_ker<128, false>>(m, "fwd_attend_ker_128_noncausal", &fwd_globals<128>::q, &fwd_globals<128>::k, &fwd_globals<128>::v, &fwd_globals<128>::l, &fwd_globals<128>::o);
     py::bind_kernel<bwd_attend_prep_ker<128>>(m, "bwd_attend_prep_ker_128", &bwd_prep_globals<128>::og, &bwd_prep_globals<128>::o, &bwd_prep_globals<128>::d);
