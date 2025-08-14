@@ -18,12 +18,13 @@ def check_diff(name, A, A_ref):
 
 # Input dimensions
 B = 1
-N = 1536
-H = 1
+N = 2048
+H = 128
 D = 128
 
 # Flag
 CHECK_CORRECTNESS = True
+BENCHMARK = True
 
 # Input tensors
 print('Generating inputs...')
@@ -84,52 +85,52 @@ if CHECK_CORRECTNESS:
     check_diff("K_grad", K_grad, K_grad_ref)
     check_diff("V_grad", V_grad, V_grad_ref)
 
-# Benchmark
-NUM_WARMUPS = 5
-NUM_ITERS = 10
+if BENCHMARK:
+    NUM_WARMUPS = 5
+    NUM_ITERS = 10
 
-start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
-end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
 
-print("\nBenchmarking forward pass...")
+    print("\nBenchmarking forward pass...")
 
-for i in range(NUM_WARMUPS):
-    bf16_attn_fwd(Q, K, V, L, O)
+    for i in range(NUM_WARMUPS):
+        bf16_attn_fwd(Q, K, V, L, O)
 
-for i in range(NUM_ITERS):
-    start_events[i].record()
-    bf16_attn_fwd(Q, K, V, L, O)
-    end_events[i].record()
-torch.cuda.synchronize()
-
-times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-avg_time = np.mean(times) * 1e-3
-std_time = np.std(times) * 1e-3
-flops = 4 * B * H * N * N * D
-tflops = flops * 1e-12
-
-print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
-print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
-
-print("\nBenchmarking backward pass...")
-
-for i in range(NUM_WARMUPS):
-    bwd_attend_prep_ker_128(O_grad, O, D_vec)
-    bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
+    for i in range(NUM_ITERS):
+        start_events[i].record()
+        bf16_attn_fwd(Q, K, V, L, O)
+        end_events[i].record()
     torch.cuda.synchronize()
 
-for i in range(NUM_ITERS):
-    start_events[i].record()
-    bwd_attend_prep_ker_128(O_grad, O, D_vec)
-    bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
-    end_events[i].record()
-torch.cuda.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    avg_time = np.mean(times) * 1e-3
+    std_time = np.std(times) * 1e-3
+    flops = 4 * B * H * N * N * D
+    tflops = flops * 1e-12
 
-times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-avg_time = np.mean(times) * 1e-3
-std_time = np.std(times) * 1e-3
-flops = 2.5 * 4 * B * H * N * N * D
-tflops = flops * 1e-12
+    print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
+    print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
 
-print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
-print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
+    print("\nBenchmarking backward pass...")
+
+    for i in range(NUM_WARMUPS):
+        bwd_attend_prep_ker_128(O_grad, O, D_vec)
+        bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
+        torch.cuda.synchronize()
+
+    for i in range(NUM_ITERS):
+        start_events[i].record()
+        bwd_attend_prep_ker_128(O_grad, O, D_vec)
+        bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
+        end_events[i].record()
+    torch.cuda.synchronize()
+
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    avg_time = np.mean(times) * 1e-3
+    std_time = np.std(times) * 1e-3
+    flops = 2.5 * 4 * B * H * N * N * D
+    tflops = flops * 1e-12
+
+    print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
+    print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
