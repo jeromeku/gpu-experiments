@@ -400,17 +400,17 @@ struct globals {
 
     using O_grad_tile = st_bf<BLOCK_SIZE, VO_DIM>;
     using O_tile = st_bf<BLOCK_SIZE, VO_DIM>;
-    using D_tile = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>;
+    using D_vec = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>;
 
     using O_grad_gl = gl<bf16, -1, -1, -1, -1, O_grad_tile>;
     using O_gl = gl<bf16, -1, -1, -1, -1, O_tile>;
-    using D_gl = gl<float, -1, -1, -1, -1, D_tile>;
+    using D_gl = gl<float, -1, -1, -1, -1, D_vec>;
 
     O_grad_gl O_grad;
     O_gl O;
     D_gl D;
 
-    __host__ inline int dynamic_shared_memory() { return sizeof(O_grad_tile) + sizeof(O_tile) + sizeof(D_tile) + 1024; }
+    __host__ inline int dynamic_shared_memory() { return sizeof(O_grad_tile) + sizeof(O_tile) + sizeof(D_vec) + 1024; }
     __host__ inline dim3 grid()  { return dim3(O_grad.rows() / BLOCK_SIZE, O_grad.depth(), O_grad.batch()); }
     __host__ inline dim3 block() { return dim3(config::NUM_THREADS); }
 };
@@ -424,7 +424,7 @@ void kernel(const __grid_constant__ globals G) {
     // Allocate shared memory
     globals::O_grad_tile &O_grad_smem = sm_allocator.allocate<globals::O_grad_tile>();
     globals::O_tile &O_smem = sm_allocator.allocate<globals::O_tile>();
-    globals::D_tile &D_smem = sm_allocator.allocate<globals::D_tile>();
+    globals::D_vec &D_smem = sm_allocator.allocate<globals::D_vec>();
 
     // Retrieve indices
     int batch_idx = blockIdx.z;
@@ -464,6 +464,71 @@ void kernel(const __grid_constant__ globals G) {
 }
 
 } // namespace bf16_attn_bwd_prep
+
+namespace bf16_attn_bwd {
+
+struct config {
+    static constexpr int CLUSTER_SIZE = 1;
+
+    static constexpr int STATIC_SHARED_MEMORY = 1024;
+    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
+
+    static constexpr int NUM_CONSUMERS = 2;
+    static constexpr int NUM_PRODUCERS = 1;
+    static constexpr int NUM_WARPGROUPS = NUM_CONSUMERS + NUM_PRODUCERS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int PRODUCER_REGISTERS = 64;
+    static constexpr int CONSUMER_REGISTERS = 104;
+};
+
+struct globals {
+    static constexpr int BLOCK_SIZE = 64;
+
+    static constexpr int QK_DIM = 128;
+    static constexpr int VO_DIM = 128;
+
+    using Q_tile  = st_bf<BLOCK_SIZE, QK_DIM>;
+    using K_tile  = st_bf<BLOCK_SIZE, QK_DIM>;
+    using V_tile  = st_bf<BLOCK_SIZE, VO_DIM>;
+    using O_grad_tile = st_bf<BLOCK_SIZE, VO_DIM>;
+    using Q_grad_tile = st_fl<BLOCK_SIZE, QK_DIM>;
+    using K_grad_tile = st_fl<BLOCK_SIZE, QK_DIM>;
+    using V_grad_tile = st_fl<BLOCK_SIZE, VO_DIM>;
+    using L_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>;
+    using D_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>;
+
+    using Q_gl = gl<bf16,  -1, -1, -1, -1, Q_tile>;
+    using K_gl = gl<bf16,  -1, -1, -1, -1, K_tile>;
+    using V_gl = gl<bf16,  -1, -1, -1, -1, V_tile>;
+    using O_grad_gl = gl<bf16,  -1, -1, -1, -1, O_grad_tile>;
+    using Q_grad_gl = gl<float, -1, -1, -1, -1, Q_grad_tile>;
+    using K_grad_gl = gl<float, -1, -1, -1, -1, K_grad_tile>;
+    using V_grad_gl = gl<float, -1, -1, -1, -1, V_grad_tile>;
+    using L_gl = gl<float, -1, -1, -1, -1, L_vec>;
+    using D_gl = gl<float, -1, -1, -1, -1, D_vec>; 
+
+    Q_gl Q;
+    K_gl K;
+    V_gl V;
+    O_grad_gl O_grad;
+    Q_grad_gl Q_grad;
+    K_grad_gl K_grad;
+    V_grad_gl V_grad;
+    L_gl L;
+    D_gl D;
+
+    __host__ inline int dynamic_shared_memory() { return config::DYNAMIC_SHARED_MEMORY; }
+    __host__ inline dim3 grid()  { return dim3(Q.rows() / (BLOCK_SIZE * 2), Q.depth(), Q.batch()); }
+    __host__ inline dim3 block() { return dim3(config::NUM_THREADS); }
+};
+
+__global__ __launch_bounds__(config::NUM_THREADS, 1)
+void kernel(const __grid_constant__ globals G) {
+}
+
+} // namespace bf16_attn_bwd
 
 constexpr int NUM_CONSUMERS = (2); 
 constexpr int WARPGROUPS_PER_CONSUMER = (2);
