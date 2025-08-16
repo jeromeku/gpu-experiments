@@ -478,9 +478,6 @@ struct config {
     static constexpr int NUM_WARPGROUPS = NUM_CONSUMERS + NUM_PRODUCERS;
     static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
-
-    static constexpr int PRODUCER_REGISTERS = 64;
-    static constexpr int CONSUMER_REGISTERS = 104;
 };
 
 struct globals {
@@ -488,6 +485,8 @@ struct globals {
 
     static constexpr int QK_DIM = 128;
     static constexpr int VO_DIM = 128;
+
+    static constexpr int PIPELINE_STAGES = 2;
 
     using Q_tile  = st_bf<BLOCK_SIZE, QK_DIM>;
     using K_tile  = st_bf<BLOCK_SIZE, QK_DIM>;
@@ -498,6 +497,7 @@ struct globals {
     using V_grad_tile = st_fl<BLOCK_SIZE, VO_DIM>;
     using L_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>;
     using D_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>;
+    using A_tile = st_bf<BLOCK_SIZE, BLOCK_SIZE>; 
 
     using Q_gl = gl<bf16,  -1, -1, -1, -1, Q_tile>;
     using K_gl = gl<bf16,  -1, -1, -1, -1, K_tile>;
@@ -518,6 +518,7 @@ struct globals {
     V_grad_gl V_grad;
     L_gl L;
     D_gl D;
+    int N;
 
     __host__ inline int dynamic_shared_memory() { return config::DYNAMIC_SHARED_MEMORY; }
     __host__ inline dim3 grid()  { return dim3(Q.rows() / (BLOCK_SIZE * 2), Q.depth(), Q.batch()); }
@@ -526,6 +527,208 @@ struct globals {
 
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
 void kernel(const __grid_constant__ globals G) {
+    // Declare shared memory
+    extern __shared__ int __shm[]; 
+    tma_swizzle_allocator sm_allocator((int*)&__shm[0]);
+
+    // Allocate shared memory
+    static_assert(
+        sizeof(globals::Q_tile) * 2 +
+        sizeof(globals::K_tile) * config::NUM_CONSUMERS +
+        sizeof(globals::V_tile) * config::NUM_CONSUMERS +
+        sizeof(globals::O_grad_tile) * 2 +
+        sizeof(globals::Q_grad_tile) +
+        sizeof(globals::L_vec) * 2 +
+        sizeof(globals::D_vec) * 2 +
+        sizeof(globals::A_tile) * config::NUM_CONSUMERS <= config::DYNAMIC_SHARED_MEMORY
+    );
+    globals::Q_tile (&Q_smem)[2] = sm_allocator.allocate<globals::Q_tile, 2>();
+    globals::K_tile (&K_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::K_tile, config::NUM_CONSUMERS>();
+    globals::V_tile (&V_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::V_tile, config::NUM_CONSUMERS>();
+    globals::O_grad_tile (&O_grad_smem)[2] = sm_allocator.allocate<globals::O_grad_tile, 2>(); 
+    globals::Q_grad_tile (&Q_grad_smem) = sm_allocator.allocate<globals::Q_grad_tile>();
+    globals::K_tile (*K_smem) = reinterpret_cast<globals::K_tile*>(&K_smem[0].data[0]);
+    globals::V_tile (*V_smem) = reinterpret_cast<globals::V_tile*>(&Q_smem[0].data[0]);
+    globals::L_vec (&L_smem)[2] = sm_allocator.allocate<globals::L_vec, 2>();
+    globals::D_vec (&D_smem)[2] = sm_allocator.allocate<globals::D_vec, 2>();
+    globals::A_tile (&A_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::A_tile, config::NUM_CONSUMERS>();
+
+    // Allocate tensor memory
+    tensor_allocator<1, config::CLUSTER_SIZE> tm_allocator {};
+    using QK_tm_t = tt<float, globals::BLOCK_SIZE, globals::QK_DIM>;
+    using VO_tm_t = tt<float, globals::BLOCK_SIZE, globals::VO_DIM>;
+    using A_tm_t = tt<float, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
+    auto K_grad_tm = tm_allocator.allocate<tt<float, 64, 128>>(warpgroup::groupid(), 0);
+    auto V_grad_tm = tm_allocator.allocate<tt<float, 64, 128>>(warpgroup::groupid(), 128);
+    auto sb_tt = tm_allocator.allocate<tt<float, 64, 64>>(warpgroup::groupid(), 256);
+    auto &pb_tt_bf = reinterpret_cast<tt<bf16, 64, 64>&>(sb_tt);
+    auto dp_tt = tm_allocator.allocate<tt<float, 64, 64>>(warpgroup::groupid(), 320);
+    auto &dp_tt_bf = reinterpret_cast<tt<bf16, 64, 64>&>(dp_tt);
+    auto Q_grad_tt = tm_allocator.allocate<tt<float, 64, 128>>(0, 384); // just used by warpgroup 0
+
+    // Set up mbarriers and launch initial loads
+    __shared__ semaphore kv_b, q_b[2], o_b[2], vec_b[2];
+    __shared__ semaphore compute_done[2], qg_ready;
+    __shared__ semaphore mma_sem[2];
+    if (threadIdx.x == 0) {
+        // Initialize mbarriers
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            init_semaphore(q_b[s], 0, 1);
+            init_semaphore(o_b[s], 0, 1); 
+            init_semaphore(vec_b[s], 0, 1);
+            init_semaphore(compute_done[s], 0, 1);
+            init_semaphore(mma_sem[s], 0, 2);
+        }
+        init_semaphore(kv_b,  0, 1);
+        init_semaphore(qg_ready, 0, 1);
+
+        // Load K and V
+        tma::expect_bytes(kv_b, (sizeof(K_smem[0]) + sizeof(V_smem[0])) * config::NUM_CONSUMERS);
+        #pragma unroll
+        for (int i = 0; i < config::NUM_CONSUMERS; i++) {
+            tma::load_async(K_smem[i], G.K, {blockIdx.z, blockIdx.y, (blockIdx.x * config::NUM_CONSUMERS) + i, 0}, kv_b);
+            tma::load_async(V_smem[i], G.V, {blockIdx.z, blockIdx.y, (blockIdx.x * config::NUM_CONSUMERS) + i, 0}, kv_b);
+        }
+    }
+
+    // TODO: these can be gone, honestly
+    int tic = 0;
+    int toc = 1;
+    if (warpgroup_id < config::NUM_CONSUMERS) {
+        rt_fl<16, 128> z;
+        warp::zero(z);
+        warpgroup::store_async(K_grad_tm, z);
+        warpgroup::store_async(V_grad_tm, z);
+        tensor_store_wait();
+    }
+
+    __syncthreads(); 
+
+    if (warpgroup::groupid() == config::NUM_CONSUMERS) {
+        // Loader/Storer group
+        warpgroup::decrease_registers<24>();
+        const int warp_id = warpgroup::warpid();
+        const int lane_id = warp::laneid();
+
+        // Declare stage and phasebits for semaphore waits
+        int stage = 0;
+        uint32_t phasebits = 0xFFFF0000;
+
+        if (warp_id == 0 && lane_id == 0) { // Loader
+            for (int i = 0; i < qo_blocks; i++) {
+                wait(compute_done[stage], get_phasebit<1>(phasebits, stage));
+                update_phasebit<1>(phasebits, stage);
+
+                // Load Q
+                tma::expect_bytes(q_b[stage], sizeof(Q_smem[stage]));
+                tma::load_async(Q_smem[stage], G.Q, {blockIdx.z, blockIdx.y, i, 0}, q_b[stage]);
+
+                // Load O_grad
+                tma::expect_bytes(o_b[stage], sizeof(O_grad_smem[stage]));
+                tma::load_async(O_grad_smem[stage], G.O_grad, {blockIdx.z, blockIdx.y, i, 0}, o_b[stage]);
+        
+                // Load L and D
+                tma::expect_bytes(vec_b[stage], sizeof(L_smem[stage]) + sizeof(D_smem[stage]));
+                tma::load_async(L_smem[stage], G.L, {blockIdx.z, blockIdx.y, 0, i}, vec_b[stage]);
+                tma::load_async(D_smem[stage], G.D, {blockIdx.z, blockIdx.y, 0, i}, vec_b[stage]);
+
+                stage = (stage + 1) % config::PIPELINE_STAGES;
+            }
+        } else if (warp_id == 1 && lane_id == 0) { // Storer
+            for (int i = q_start; i < qo_blocks; i++) {
+                wait(compute_done[stage], get_phasebit<0>(phasebits, stage));
+                update_phasebit<1>(phasebits, stage);
+
+                tma::store_add_async(G.Q_grad, Q_grad_smem, {blockIdx.z, blockIdx.y, i, 0});
+                tma::store_async_wait(); // TODO: change to read_wait
+                arrive(qg_ready); 
+
+                stage = (stage + 1) % config::PIPELINE_STAGES;
+            }
+        }
+    } else {
+
+
+
+
+
+
+
+
+
+
+
+
+        
+        wg_tmem_t wg_tmem{kg_tt, vg_tt, sb_tt, dp_tt, pb_tt_bf, dp_tt_bf, &mma_sem[warpgroupid]};
+        rt_fl<16, G::tile_width> kg_reg, vg_reg;
+    
+        row_vec<rt_fl<16, 64>> row_reg; 
+
+        rt_fl<16, 64> s_block_t,  p_block_t; 
+        rt_fl<16, 64> ds_block_t, dp_block_t; 
+        rt_bf<16, 64> ds_block_t_mma, p_block_t_mma;
+
+        if (warpgroupid == 0) {
+            warpgroup::increase_registers<256>();
+            wait(kv_b, 0);
+            for (int qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic ^= 1, toc ^= 1) {
+                compute_bwd_loop<is_causal, G::tile_h_qo, G::tile_h, G::tile_width, D>(
+                    wg_tmem,
+                    vec_b, q_b, o_b,
+                    s_block_t, dp_block_t, p_block_t, ds_block_t, p_block_t_mma, ds_block_t_mma,
+                    kg_reg, vg_reg,
+                    q_smem, k_smem, v_smem, og_smem, ds_smem, l_smem, d_smem,
+                    qo_idx, q_start, tic, toc
+                );
+
+                rt_fl<16, G::tile_width> qg_reg; 
+                // warpgroup::mm_AtB(qg_reg, ds_smem[0], k_smem[0]);
+                // warpgroup::mma_AtB(qg_reg, ds_smem[1], k_smem[1]);
+                if(warpgroup::laneid() == 0) {
+                    mm_AtB(qg_tt, ds_smem[0], k_smem[0], mma_sem[0]);
+                    mma_AtB(qg_tt, ds_smem[1], k_smem[1], mma_sem[0]);
+                }
+    
+                wait(qg_ready, toc);
+                if (qo_idx > 0) tma::store_async_wait();
+
+                // warpgroup::mma_async_wait();
+                wait(mma_sem[0], 0);
+                if(warpgroup::laneid() == 0) arrive(mma_sem[0], 2);
+                warpgroup::load_async(qg_reg, qg_tt);
+                warpgroup::store(qg_smem, qg_reg);
+                group<4>::sync(warpgroup::groupid()+4);
+    
+                if (warpgroup::laneid() == 0) arrive(compute_done[tic]);
+            }
+            warpgroup::load_async(kg_reg, kg_tt);
+            warpgroup::load_async(vg_reg, vg_tt);
+            // one(kg_reg);
+            // one(vg_reg);
+            kv_store<kg_tile, vg_tile>(kg_smem, kg_reg, vg_smem, vg_reg, g, qg_ready, kv_head_idx, toc);
+        }
+        else {
+            warpgroup::increase_registers<224>();
+            wait(kv_b, 0);
+            for (int qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic ^= 1, toc ^= 1) {
+                compute_bwd_loop<is_causal, G::tile_h_qo, G::tile_h, G::tile_width, D>(
+                    wg_tmem,
+                    vec_b, q_b, o_b,
+                    s_block_t, dp_block_t, p_block_t, ds_block_t, p_block_t_mma, ds_block_t_mma,
+                    kg_reg, vg_reg,
+                    q_smem, k_smem, v_smem, og_smem, ds_smem, l_smem, d_smem,
+                    qo_idx, q_start, tic, toc
+                );
+            }
+            warpgroup::load_async(kg_reg, kg_tt);
+            warpgroup::load_async(vg_reg, vg_tt);
+            // one(kg_reg);
+            // one(vg_reg);
+            kv_store<kg_tile, vg_tile>(kg_smem, kg_reg, vg_smem, vg_reg, g, qg_ready, kv_head_idx, toc);
+        }
+    }
 }
 
 } // namespace bf16_attn_bwd
