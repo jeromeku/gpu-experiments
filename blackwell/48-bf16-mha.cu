@@ -553,8 +553,8 @@ void kernel(const __grid_constant__ globals G) {
     globals::V_tile (&V_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::V_tile, config::NUM_CONSUMERS>();
     globals::O_grad_tile (&O_grad_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::O_grad_tile, globals::PIPELINE_STAGES>(); 
     globals::Q_grad_tile (&Q_grad_smem) = sm_allocator.allocate<globals::Q_grad_tile>();
-    globals::K_tile (&K_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::K_tile(*)[config::NUM_CONSUMERS]>(&K_smem[0].data[0]);
-    globals::V_tile (&V_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::V_tile(*)[config::NUM_CONSUMERS]>(&Q_smem[0].data[0]);
+    globals::K_grad_tile (&K_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::K_grad_tile(*)[config::NUM_CONSUMERS]>(&K_smem[0].data[0]);
+    globals::V_grad_tile (&V_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::V_grad_tile(*)[config::NUM_CONSUMERS]>(&Q_smem[0].data[0]);
     globals::L_vec (&L_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::L_vec, globals::PIPELINE_STAGES>();
     globals::D_vec (&D_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::D_vec, globals::PIPELINE_STAGES>();
     globals::A_tile (&dS_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::A_tile, config::NUM_CONSUMERS>();
