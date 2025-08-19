@@ -317,7 +317,6 @@ static void kernel(const __grid_constant__ globals G) {
                 col_vec<rt_fl<ROWS_PER_WARP, globals::BLOCK_SIZE>> max_vec_last_scaled, max_vec_scaled;
                 warp::mul(max_vec_last_scaled, max_vec, LOG2E * SQRT_D_INV);
                 warp::row_max(max_vec, A_fl_reg, max_vec);
-                col_vec<rt_fl<ROWS_PER_WARP, globals::BLOCK_SIZE>> ;
                 warp::mul(max_vec_scaled, max_vec, -LOG2E * SQRT_D_INV);
                 warp::row_map<rescale_add>(A_fl_reg, A_fl_reg, max_vec_scaled);
                 warp::exp2(A_fl_reg, A_fl_reg);
@@ -497,7 +496,7 @@ struct globals {
     using V_grad_tile = st_fl<BLOCK_SIZE, VO_DIM>;
     using L_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>;
     using D_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>;
-    using A_tile = st_bf<BLOCK_SIZE, BLOCK_SIZE>; 
+    using SP_tile = st_bf<BLOCK_SIZE, BLOCK_SIZE>; 
 
     using Q_gl = gl<bf16,  -1, -1, -1, -1, Q_tile>;
     using K_gl = gl<bf16,  -1, -1, -1, -1, K_tile>;
@@ -530,7 +529,7 @@ void kernel(const __grid_constant__ globals G) {
     const int batch_idx = blockIdx.z;
     const int head_idx = blockIdx.y;
     const int KV_block_idx = blockIdx.x;
-    const int num_QO_blocks = G.Q.rows() / (globals::BLOCK_SIZE * 2);
+    const int num_QO_blocks = G.Q.rows() / globals::BLOCK_SIZE; // Q is 64x128, KV is 128x128
     const int warpgroup_id = warpgroup::groupid();
 
     // Declare shared memory
@@ -546,18 +545,18 @@ void kernel(const __grid_constant__ globals G) {
         sizeof(globals::Q_grad_tile) +
         sizeof(globals::L_vec) * globals::PIPELINE_STAGES +
         sizeof(globals::D_vec) * globals::PIPELINE_STAGES +
-        sizeof(globals::A_tile) * config::NUM_CONSUMERS <= config::DYNAMIC_SHARED_MEMORY
+        sizeof(globals::SP_tile) * config::NUM_CONSUMERS <= config::DYNAMIC_SHARED_MEMORY
     );
     globals::Q_tile (&Q_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::Q_tile, globals::PIPELINE_STAGES>();
     globals::K_tile (&K_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::K_tile, config::NUM_CONSUMERS>();
     globals::V_tile (&V_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::V_tile, config::NUM_CONSUMERS>();
     globals::O_grad_tile (&O_grad_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::O_grad_tile, globals::PIPELINE_STAGES>(); 
     globals::Q_grad_tile (&Q_grad_smem) = sm_allocator.allocate<globals::Q_grad_tile>();
-    globals::K_grad_tile (&K_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::K_grad_tile(*)[config::NUM_CONSUMERS]>(&K_smem[0].data[0]);
-    globals::V_grad_tile (&V_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::V_grad_tile(*)[config::NUM_CONSUMERS]>(&Q_smem[0].data[0]);
+    globals::K_grad_tile (&K_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::K_grad_tile(*)[config::NUM_CONSUMERS]>(&Q_smem[0].data[0]);
+    globals::V_grad_tile (&V_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::V_grad_tile(*)[config::NUM_CONSUMERS]>(&V_smem[0].data[0]);
     globals::L_vec (&L_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::L_vec, globals::PIPELINE_STAGES>();
     globals::D_vec (&D_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::D_vec, globals::PIPELINE_STAGES>(); 
-    globals::A_tile (&dS_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::A_tile, config::NUM_CONSUMERS>();
+    globals::SP_tile (&dS_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::SP_tile, config::NUM_CONSUMERS>();
 
     // Allocate tensor memory
     tensor_allocator<1, config::CLUSTER_SIZE> tm_allocator {};
@@ -634,7 +633,7 @@ void kernel(const __grid_constant__ globals G) {
 
                 tma::store_add_async(G.Q_grad, Q_grad_smem, {batch_idx, head_idx, i, 0});
                 tma::store_async_read_wait();
-                arrive(Q_grad_ready); 
+                arrive(Q_grad_ready);
 
                 stage = (stage + 1) % globals::PIPELINE_STAGES;
             }
@@ -653,15 +652,6 @@ void kernel(const __grid_constant__ globals G) {
         // Declare stage and phasebits for semaphore waits
         int stage = 0;
         uint32_t phasebits = 0xFFFF0000;
-
-        // Declare register tiles and vectors
-        rt_fl<16, 128> Q_grad_reg;
-        rt_fl<16, 128> K_grad_reg;
-        rt_fl<16, 128> V_grad_reg;
-        
-        rt_fl<16, 64> dS_t_reg;
-        rt_bf<16, 64> dS_t_mma_reg;
-        rt_bf<16, 64> P_t_mma_reg; // TODO: needed?
 
         // Declare K and V TMEM
         auto K_grad_tm = tm_allocator.allocate<tt<float, 64, 128>>(warpgroup_id, 0);
@@ -712,7 +702,9 @@ void kernel(const __grid_constant__ globals G) {
 
             // Move P_t to TMEM
             auto &P_t_bf_tm = reinterpret_cast<tt<bf16, 64, 64>&>(S_t_tm);
-            warpgroup::store_async(P_t_bf_tm, SP_t_reg);
+            rt_bf<16, 64> SP_t_bf_reg;
+            warp::copy(SP_t_bf_reg, SP_t_reg);
+            warpgroup::store_async(P_t_bf_tm, SP_t_bf_reg);
 
             // dP_t = (dO @ V^T)^T - D
             #pragma unroll
@@ -738,7 +730,9 @@ void kernel(const __grid_constant__ globals G) {
 
             // dK = dS^T @ Q
             auto &dS_t_bf_tm = reinterpret_cast<tt<bf16, 64, 64>&>(dP_t_tm);
-            warpgroup::store_async(dS_t_bf_tm, dSP_t_reg);
+            rt_bf<16, 64> dSP_t_bf_reg;
+            warp::copy(dSP_t_bf_reg, dSP_t_reg);
+            warpgroup::store_async(dS_t_bf_tm, dSP_t_bf_reg);
             tensor_store_wait();
             warpgroup::sync(warpgroup_id + 2);
             if (i == 0)
@@ -746,7 +740,6 @@ void kernel(const __grid_constant__ globals G) {
             else
                 warpgroup::mma_AB(K_grad_tm, dS_t_bf_tm, Q_smem[stage], matmul_finished[warpgroup_id]);
 
-            // TODO: why can't I use the same dS_t_tm?
             warpgroup::store(dS_smem[warpgroup_id], dSP_t_reg);
             wait(matmul_finished[warpgroup_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
             update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
@@ -765,6 +758,7 @@ void kernel(const __grid_constant__ globals G) {
                 update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
 
                 // Store Q_grad and signal
+                rt_fl<16, 128> Q_grad_reg;
                 warpgroup::load_async(Q_grad_reg, Q_grad_tm);
                 warpgroup::store(Q_grad_smem, Q_grad_reg);
                 warpgroup::sync(warpgroup_id + 2);
@@ -776,21 +770,23 @@ void kernel(const __grid_constant__ globals G) {
         }
 
         // Load finished K_grad and V_grad
+        rt_fl<16, 128> K_grad_reg;
+        rt_fl<16, 128> V_grad_reg;
         warpgroup::load_async(K_grad_reg, K_grad_tm);
         warpgroup::load_async(V_grad_reg, V_grad_tm);
 
+        // Store V_grad
+        warpgroup::store(V_grad_smem[warpgroup_id], V_grad_reg);
+        warpgroup::sync(2 + warpgroup_id);
+        warpgroup::tma::store_add_async(G.V_grad, V_grad_smem[warpgroup_id], {batch_idx, head_idx, (KV_block_idx * config::NUM_CONSUMERS) + warpgroup_id, 0});
+
         // Store K_grad
+        wait(Q_grad_ready, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+        update_phasebit<1>(phasebits, globals::PIPELINE_STAGES); // TODO: remove
         group<config::NUM_CONSUMERS * WARPGROUP_WARPS>::sync(1);
         warpgroup::store(K_grad_smem[warpgroup_id], K_grad_reg);
         warpgroup::sync(2 + warpgroup_id);
         warpgroup::tma::store_add_async(G.K_grad, K_grad_smem[warpgroup_id], {batch_idx, head_idx, (KV_block_idx * config::NUM_CONSUMERS) + warpgroup_id, 0});
-
-        // Store V_grad
-        wait(Q_grad_ready, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
-        update_phasebit<1>(phasebits, globals::PIPELINE_STAGES); // TODO: remove
-        warpgroup::store(V_grad_smem[warpgroup_id], V_grad_reg);
-        warpgroup::sync(2 + warpgroup_id);
-        warpgroup::tma::store_add_async(G.V_grad, V_grad_smem[warpgroup_id], {batch_idx, head_idx, (KV_block_idx * config::NUM_CONSUMERS) + warpgroup_id, 0});
     }
 }
 

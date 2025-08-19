@@ -24,7 +24,7 @@ D = 128
 
 # Flags
 CHECK_CORRECTNESS = True
-CHECK_TORCH_REFERENCE = False
+CHECK_TORCH_REFERENCE = True
 BENCHMARK = False
 
 # Input tensors
@@ -99,7 +99,7 @@ if CHECK_CORRECTNESS:
                 S_ij = Q[:, :, QO_start:QO_end, :] @ K[:, :, KV_start:KV_end, ].transpose(-1, -2) / (D ** 0.5)
                 P_grad_ij = O_grad[:, :, QO_start:QO_end, :] @ V[:, :, KV_start:KV_end, :].transpose(-1, -2)
                 P_ij = torch.exp(S_ij.to(torch.float32) - L_ref[:, :, 0, QO_start:QO_end].unsqueeze(-1))
-                S_grad_ij = P_ij * (P_grad_ij.to(torch.float32) - D_vec[:, :, 0, QO_start:QO_end].unsqueeze(-1)) / (D ** 0.5)
+                S_grad_ij = P_ij * (P_grad_ij.to(torch.float32) - D_vec_ref[:, :, 0, QO_start:QO_end].unsqueeze(-1)) / (D ** 0.5)
                 V_grad_torch_fa[:, :, KV_start:KV_end, :] += P_ij.to(torch.bfloat16).transpose(-1, -2) @ O_grad[:, :, QO_start:QO_end, :]
                 K_grad_torch_fa[:, :, KV_start:KV_end, :] += S_grad_ij.to(torch.bfloat16).transpose(-1, -2) @ Q[:, :, QO_start:QO_end, :]
                 Q_grad_torch_fa[:, :, QO_start:QO_end, :] += S_grad_ij.to(torch.bfloat16) @ K[:, :, KV_start:KV_end, :]
