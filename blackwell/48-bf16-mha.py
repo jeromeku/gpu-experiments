@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 torch.manual_seed(42)
+torch.set_printoptions(sci_mode=False)
 
 # Import our Python bindings
 from _C import bf16_mha_fwd, bf16_mha_bwd_prep, bf16_mha_bwd

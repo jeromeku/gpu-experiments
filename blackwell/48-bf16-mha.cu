@@ -629,7 +629,7 @@ void kernel(const __grid_constant__ globals G) {
         } else if (warp_id == 1 && lane_id == 0) { // Storer (TODO: is this even necessary)
             for (int i = 0; i < num_QO_blocks; i++) {
                 wait(compute_done[stage], get_phasebit<0>(phasebits, stage));
-                update_phasebit<1>(phasebits, stage);
+                update_phasebit<0>(phasebits, stage);
 
                 tma::store_add_async(G.Q_grad, Q_grad_smem, {batch_idx, head_idx, i, 0});
                 tma::store_async_read_wait();
@@ -1696,8 +1696,8 @@ PYBIND11_MODULE(_C, m) {
         &bf16_mha_bwd::globals::Q_grad,
         &bf16_mha_bwd::globals::K_grad,
         &bf16_mha_bwd::globals::V_grad,
-        &bf16_mha_bwd::globals::D,
-        &bf16_mha_bwd::globals::L
+        &bf16_mha_bwd::globals::L,
+        &bf16_mha_bwd::globals::D
     );
     py::bind_kernel<fwd_attend_ker<128, false>>(m, "fwd_attend_ker_128_noncausal", &fwd_globals<128>::q, &fwd_globals<128>::k, &fwd_globals<128>::v, &fwd_globals<128>::l, &fwd_globals<128>::o);
     py::bind_kernel<bwd_attend_prep_ker<128>>(m, "bwd_attend_prep_ker_128", &bwd_prep_globals<128>::og, &bwd_prep_globals<128>::o, &bwd_prep_globals<128>::d);
