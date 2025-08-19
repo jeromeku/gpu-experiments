@@ -1,3 +1,19 @@
+/*
+    Benchmarks (B=8 N=8192 H=128 D=128)
+
+    Original ThunderKittens B200 MHA Implementation:
+      - FWD: 273.33 TFLOP/s
+      - BWD Prep: 6298.60 GB/s
+      - BWD: 650.11 TFLOP/s
+
+    This version:
+      - FWD: 858.63 TFLOP/s
+      - BWD Prep: 7184.93 GB/s
+      - BWD: 608.22 TFLOP/s
+
+    Not the best, but a reasonable starting point.
+*/
+
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "pyutils/pyutils.cuh"
