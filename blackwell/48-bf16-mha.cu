@@ -294,7 +294,7 @@ static void kernel(const __grid_constant__ globals G) {
             }
 
             rt_fl<ROWS_PER_WARP, globals::VO_DIM> O_reg;
-            col_vec<rt_fl<ROWS_PER_WARP, globals::BLOCK_SIZE>> max_vec, max_vec_scaled, max_vec_last_scaled, norm_vec;
+            col_vec<rt_fl<ROWS_PER_WARP, globals::BLOCK_SIZE>> max_vec, norm_vec;
             warp::zero(O_reg);
             warp::neg_infty(max_vec);
             warp::zero(norm_vec);
@@ -314,18 +314,18 @@ static void kernel(const __grid_constant__ globals G) {
 
                 // Perform softmax
                 rt_bf<ROWS_PER_WARP, globals::BLOCK_SIZE> A_bf_reg;
-                {
-                    warp::mul(max_vec_last_scaled, max_vec, LOG2E * SQRT_D_INV);
-                    warp::row_max(max_vec, A_fl_reg, max_vec);
-                    warp::mul(max_vec_scaled, max_vec, -LOG2E * SQRT_D_INV);
-                    warp::row_map<rescale_add>(A_fl_reg, A_fl_reg, max_vec_scaled);
-                    warp::exp2(A_fl_reg, A_fl_reg);
-                    warp::add(max_vec_last_scaled, max_vec_scaled, max_vec_last_scaled);
-                    warp::exp2(max_vec_last_scaled, max_vec_last_scaled);
-                    warp::mul(norm_vec, max_vec_last_scaled, norm_vec);
-                    warp::row_sum(norm_vec, A_fl_reg, norm_vec);
-                    warp::copy(A_bf_reg, A_fl_reg);
-                }
+                col_vec<rt_fl<ROWS_PER_WARP, globals::BLOCK_SIZE>> max_vec_last_scaled, max_vec_scaled;
+                warp::mul(max_vec_last_scaled, max_vec, LOG2E * SQRT_D_INV);
+                warp::row_max(max_vec, A_fl_reg, max_vec);
+                col_vec<rt_fl<ROWS_PER_WARP, globals::BLOCK_SIZE>> ;
+                warp::mul(max_vec_scaled, max_vec, -LOG2E * SQRT_D_INV);
+                warp::row_map<rescale_add>(A_fl_reg, A_fl_reg, max_vec_scaled);
+                warp::exp2(A_fl_reg, A_fl_reg);
+                warp::add(max_vec_last_scaled, max_vec_scaled, max_vec_last_scaled);
+                warp::exp2(max_vec_last_scaled, max_vec_last_scaled);
+                warp::mul(norm_vec, max_vec_last_scaled, norm_vec);
+                warp::row_sum(norm_vec, A_fl_reg, norm_vec);
+                warp::copy(A_bf_reg, A_fl_reg);
 
                 if (i > task_info.KV_block_start) {
                     tma::cluster::wait(AV_finished[consumer_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES + 1));
@@ -333,7 +333,7 @@ static void kernel(const __grid_constant__ globals G) {
                     if (all_consumers::laneid() == 0) arrive(V_finished[V_stage]);
                     V_stage = (V_stage + 1) % globals::PIPELINE_STAGES;
                 }
-                
+
                 consumer::load_async(O_reg, AV_tm[consumer_id]);
                 consumer::store(A_smem[consumer_id], A_bf_reg);
                 warp::mul_row(O_reg, O_reg, max_vec_last_scaled);
@@ -361,9 +361,9 @@ static void kernel(const __grid_constant__ globals G) {
                                   config::NUM_CONSUMERS * cta_id + consumer_id, 0});
             }
 
-            warp::mul(max_vec_scaled, max_vec_scaled, NEG_LOGE2);
+            warp::mul(max_vec, max_vec, SQRT_D_INV);
             warp::log(norm_vec, norm_vec);
-            warp::add(norm_vec, norm_vec, max_vec_scaled);
+            warp::add(norm_vec, norm_vec, max_vec);
             warp::mul(norm_vec, norm_vec, NEG_SQRT_D);
 
             consumer::store(L_smem[consumer_id], norm_vec);
