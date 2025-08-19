@@ -24,6 +24,7 @@ D = 128
 
 # Flags
 CHECK_CORRECTNESS = True
+CHECK_TORCH_REFERENCE = False
 BENCHMARK = False
 
 # Input tensors
@@ -72,38 +73,39 @@ if CHECK_CORRECTNESS:
     V_grad_ref = V.grad.detach()
     D_vec_ref = (O * O_grad).sum(dim=-1).unsqueeze(2)
 
-    # Run backward Pytorch
-    V_grad_torch = torch.matmul(P.transpose(-2, -1), O_grad)              # dV = P^T @ dO
-    P_grad = torch.matmul(O_grad, V.transpose(-2, -1))                    # dP = dO @ V^T
-    S_grad = (P_grad * P - P * (P_grad * P).sum(dim=-1, keepdim=True))    # dS = (diag(P) - P @ P^T) @ dP
-    Q_grad_torch = torch.matmul(S_grad, K) / (D ** 0.5)                   # dQ = dS @ K
-    K_grad_torch = torch.matmul(S_grad.transpose(-2, -1), Q) / (D ** 0.5) # dK = dS^T @ Q
-    check_diff("Q_grad_torch", Q_grad_torch, Q_grad_ref)
-    check_diff("K_grad_torch", K_grad_torch, K_grad_ref)
-    check_diff("V_grad_torch", V_grad_torch, V_grad_ref)
+    if CHECK_TORCH_REFERENCE:
+        # Run backward Pytorch
+        V_grad_torch = torch.matmul(P.transpose(-2, -1), O_grad)              # dV = P^T @ dO
+        P_grad = torch.matmul(O_grad, V.transpose(-2, -1))                    # dP = dO @ V^T
+        S_grad = (P_grad * P - P * (P_grad * P).sum(dim=-1, keepdim=True))    # dS = (diag(P) - P @ P^T) @ dP
+        Q_grad_torch = torch.matmul(S_grad, K) / (D ** 0.5)                   # dQ = dS @ K
+        K_grad_torch = torch.matmul(S_grad.transpose(-2, -1), Q) / (D ** 0.5) # dK = dS^T @ Q
+        check_diff("Q_grad_torch", Q_grad_torch, Q_grad_ref)
+        check_diff("K_grad_torch", K_grad_torch, K_grad_ref)
+        check_diff("V_grad_torch", V_grad_torch, V_grad_ref)
 
-    # Run backward Pytorch with FA recipe
-    BLOCK_SIZE = 64
-    NUM_BLOCKS = N // BLOCK_SIZE
-    Q_grad_torch_fa = torch.zeros_like(Q, dtype=torch.float, device="cuda")
-    K_grad_torch_fa = torch.zeros_like(K, dtype=torch.float, device="cuda")
-    V_grad_torch_fa = torch.zeros_like(V, dtype=torch.float, device="cuda")
-    for j in range(NUM_BLOCKS):
-        KV_start = j * BLOCK_SIZE
-        KV_end = (j + 1) * BLOCK_SIZE
-        for i in range(NUM_BLOCKS):
-            QO_start = i * BLOCK_SIZE
-            QO_end = (i + 1) * BLOCK_SIZE
-            S_ij = Q[:, :, QO_start:QO_end, :] @ K[:, :, KV_start:KV_end, ].transpose(-1, -2) / (D ** 0.5)
-            P_grad_ij = O_grad[:, :, QO_start:QO_end, :] @ V[:, :, KV_start:KV_end, :].transpose(-1, -2)
-            P_ij = torch.exp(S_ij.to(torch.float32) - L_ref[:, :, 0, QO_start:QO_end].unsqueeze(-1))
-            S_grad_ij = P_ij * (P_grad_ij.to(torch.float32) - D_vec[:, :, 0, QO_start:QO_end].unsqueeze(-1)) / (D ** 0.5)
-            V_grad_torch_fa[:, :, KV_start:KV_end, :] += P_ij.to(torch.bfloat16).transpose(-1, -2) @ O_grad[:, :, QO_start:QO_end, :]
-            K_grad_torch_fa[:, :, KV_start:KV_end, :] += S_grad_ij.to(torch.bfloat16).transpose(-1, -2) @ Q[:, :, QO_start:QO_end, :]
-            Q_grad_torch_fa[:, :, QO_start:QO_end, :] += S_grad_ij.to(torch.bfloat16) @ K[:, :, KV_start:KV_end, :]
-    check_diff("Q_grad_torch_fa", Q_grad_torch_fa, Q_grad_ref)
-    check_diff("K_grad_torch_fa", K_grad_torch_fa, K_grad_ref)
-    check_diff("V_grad_torch_fa", V_grad_torch_fa, V_grad_ref)
+        # Run backward Pytorch with FA recipe
+        BLOCK_SIZE = 64
+        NUM_BLOCKS = N // BLOCK_SIZE
+        Q_grad_torch_fa = torch.zeros_like(Q, dtype=torch.float, device="cuda")
+        K_grad_torch_fa = torch.zeros_like(K, dtype=torch.float, device="cuda")
+        V_grad_torch_fa = torch.zeros_like(V, dtype=torch.float, device="cuda")
+        for j in range(NUM_BLOCKS):
+            KV_start = j * BLOCK_SIZE
+            KV_end = (j + 1) * BLOCK_SIZE
+            for i in range(NUM_BLOCKS):
+                QO_start = i * BLOCK_SIZE
+                QO_end = (i + 1) * BLOCK_SIZE
+                S_ij = Q[:, :, QO_start:QO_end, :] @ K[:, :, KV_start:KV_end, ].transpose(-1, -2) / (D ** 0.5)
+                P_grad_ij = O_grad[:, :, QO_start:QO_end, :] @ V[:, :, KV_start:KV_end, :].transpose(-1, -2)
+                P_ij = torch.exp(S_ij.to(torch.float32) - L_ref[:, :, 0, QO_start:QO_end].unsqueeze(-1))
+                S_grad_ij = P_ij * (P_grad_ij.to(torch.float32) - D_vec[:, :, 0, QO_start:QO_end].unsqueeze(-1)) / (D ** 0.5)
+                V_grad_torch_fa[:, :, KV_start:KV_end, :] += P_ij.to(torch.bfloat16).transpose(-1, -2) @ O_grad[:, :, QO_start:QO_end, :]
+                K_grad_torch_fa[:, :, KV_start:KV_end, :] += S_grad_ij.to(torch.bfloat16).transpose(-1, -2) @ Q[:, :, QO_start:QO_end, :]
+                Q_grad_torch_fa[:, :, QO_start:QO_end, :] += S_grad_ij.to(torch.bfloat16) @ K[:, :, KV_start:KV_end, :]
+        check_diff("Q_grad_torch_fa", Q_grad_torch_fa, Q_grad_ref)
+        check_diff("K_grad_torch_fa", K_grad_torch_fa, K_grad_ref)
+        check_diff("V_grad_torch_fa", V_grad_torch_fa, V_grad_ref)
 
     # Check backward pass
     check_diff("D_vec", D_vec, D_vec_ref)
