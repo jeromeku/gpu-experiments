@@ -3,7 +3,7 @@ import torch
 torch.manual_seed(42)
 
 # Import our Python bindings
-from _C import bf16_mha_fwd, bf16_mha_bwd_prep, bwd_attend_ker_128_noncausal
+from _C import bf16_mha_fwd, bf16_mha_bwd_prep, bf16_mha_bwd
 
 
 def check_diff(name, A, A_ref):
@@ -18,7 +18,7 @@ def check_diff(name, A, A_ref):
 
 # Input dimensions
 B = 1
-N = 2048
+N = 128
 H = 1
 D = 128
 
@@ -48,7 +48,7 @@ if CHECK_CORRECTNESS:
     # Run backward kernel
     print("\nRunning backward kernel...")
     bf16_mha_bwd_prep(O_grad, O, D_vec)
-    bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
+    bf16_mha_bwd(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec)
     torch.cuda.synchronize()
 
     # Run forward reference
@@ -182,13 +182,13 @@ if BENCHMARK:
 
     for i in range(NUM_WARMUPS):
         bf16_mha_bwd_prep(O_grad, O, D_vec)
-        bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
+        bf16_mha_bwd(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec)
         torch.cuda.synchronize()
 
     for i in range(NUM_ITERS):
         start_events[i].record()
         bf16_mha_bwd_prep(O_grad, O, D_vec)
-        bwd_attend_ker_128_noncausal(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec, Q.shape[-2], 1)
+        bf16_mha_bwd(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec)
         end_events[i].record()
     torch.cuda.synchronize()
 
