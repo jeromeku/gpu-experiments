@@ -27,6 +27,7 @@ D = 128
 CHECK_CORRECTNESS = True
 CHECK_TORCH_REFERENCE = True
 BENCHMARK = False
+BENCHMARK_FA_SM100 = False
 
 # Input tensors
 print('Generating inputs...')
@@ -125,6 +126,7 @@ if BENCHMARK:
 
     for i in range(NUM_WARMUPS):
         bf16_mha_fwd(Q, K, V, L, O)
+        torch.cuda.synchronize()
 
     for i in range(NUM_ITERS):
         start_events[i].record()
@@ -179,6 +181,42 @@ if BENCHMARK:
     avg_time = np.mean(times) * 1e-3
     std_time = np.std(times) * 1e-3
     flops = 2.5 * 4 * B * H * N * N * D
+    tflops = flops * 1e-12
+
+    print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
+    print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
+
+if BENCHMARK_FA_SM100:
+    def flash_attn_fwd(Q, K, V):
+        from flash_attn.cute.interface import _flash_attn_fwd
+        _flash_attn_fwd(Q, K, V, causal=False)
+
+    Q_ = Q.transpose(1, 2).contiguous()
+    K_ = K.transpose(1, 2).contiguous()
+    V_ = V.transpose(1, 2).contiguous()
+
+    NUM_WARMUPS = 5
+    NUM_ITERS = 10
+
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(NUM_ITERS)]
+
+    print("\nBenchmarking FA SM100 forward pass...")
+
+    for i in range(NUM_WARMUPS):
+        flash_attn_fwd(Q_, K_, V_)
+        torch.cuda.synchronize()
+
+    for i in range(NUM_ITERS):
+        start_events[i].record()
+        flash_attn_fwd(Q_, K_, V_)
+        end_events[i].record()
+    torch.cuda.synchronize()
+
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    avg_time = np.mean(times) * 1e-3
+    std_time = np.std(times) * 1e-3
+    flops = 4 * B * H * N * N * D
     tflops = flops * 1e-12
 
     print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
