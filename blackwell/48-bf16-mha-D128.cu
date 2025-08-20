@@ -7,7 +7,10 @@
       - BWD: 650.11 TFLOP/s
 
     This version:
-      - FWD: 858.63 TFLOP/s
+      - FWD:
+            Two consumers: 858.63 TFLOP/s
+            One consumer : 825.12 TFLOP/s
+            --> Having two consumers do not dramatically improve perf. In fact, I think there are more opportunities from free TMEM
       - BWD Prep: 7184.93 GB/s
       - BWD: 608.22 TFLOP/s
 
@@ -172,7 +175,7 @@ static void kernel(const __grid_constant__ globals G) {
         }
         #pragma unroll
         for (int i = 0; i < config::NUM_CONSUMERS; ++i) {
-            init_semaphore(Q_arrived, 0, config::CLUSTER_SIZE * 2);
+            init_semaphore(Q_arrived, 0, config::CLUSTER_SIZE * config::NUM_CONSUMERS);
             init_semaphore(A_unloaded[i], 0, config::CLUSTER_SIZE);
             init_semaphore(A_loaded[i], 0, config::CLUSTER_SIZE);
             init_semaphore(QK_finished[i], 0, 1);
