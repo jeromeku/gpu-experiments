@@ -14,10 +14,7 @@ struct config {
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
 
-    static constexpr int NUM_CONSUMERS = 2;
-    static constexpr int WARPGROUPS_PER_CONSUMER = 2;
-    static constexpr int NUM_PRODUCERS = 1;
-    static constexpr int NUM_WARPGROUPS = NUM_CONSUMERS * WARPGROUPS_PER_CONSUMER + NUM_PRODUCERS;
+    static constexpr int NUM_WARPGROUPS = 4;
     static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
@@ -31,14 +28,14 @@ struct globals {
     static constexpr int QK_DIM = 128;
     static constexpr int VO_DIM = 128;
 
-    static constexpr int PIPELINE_STAGES = 2;
+    static constexpr int PIPELINE_STAGES = 3;
+    static constexpr int NUM_PIPELINES = 2;
 
-    using Q_tile = st_bf<BLOCK_SIZE, QK_DIM>;
-    using K_tile = st_bf<BLOCK_SIZE / 2, QK_DIM>;
-    using V_tile = st_bf<BLOCK_SIZE, VO_DIM / 2>;
-    using L_vec  = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>;
-    using O_tile = st_bf<BLOCK_SIZE, VO_DIM>;
-    using A_tile = st_bf<BLOCK_SIZE, BLOCK_SIZE>;
+    using Q_tile = st_bf<BLOCK_SIZE, QK_DIM>;          // 32768 B
+    using K_tile = st_bf<BLOCK_SIZE / 2, QK_DIM>;      // 16384 B
+    using V_tile = st_bf<BLOCK_SIZE, VO_DIM / 2>;      // 16384 B
+    using L_vec  = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>; // 512   B
+    using O_tile = st_bf<BLOCK_SIZE, VO_DIM>;          // 32768 B
 
     using Q_gl = gl<bf16,  -1, -1, -1, -1, Q_tile>; // B, H, N, D
     using K_gl = gl<bf16,  -1, -1, -1, -1, K_tile>;
@@ -65,9 +62,8 @@ struct globals {
     };
 };
 
-__device__ static inline globals::task_info get_task_info(const globals &G, int task_idx) {
-    constexpr int Q_block_size = 2 * config::NUM_CONSUMERS * globals::BLOCK_SIZE;
-    const int num_QO_blocks = G.K.rows() / globals::BLOCK_SIZE;
+__device__ inline globals::task_info get_task_info(const globals &G, int task_idx) {
+    constexpr int Q_block_size = 2 * globals::NUM_PIPELINES * globals::BLOCK_SIZE;
 
     const int B = G.Q.batch();
     const int H = G.Q.depth();
@@ -81,7 +77,7 @@ __device__ static inline globals::task_info get_task_info(const globals &G, int 
     task_info.Q_block_idx = task_idx;
 
     task_info.KV_block_start = 0;
-    task_info.KV_block_end = num_QO_blocks;
+    task_info.KV_block_end = G.K.rows() / globals::BLOCK_SIZE;
 
     if (task_info.batch_idx >= B)
         return { -1, -1, -1 };
@@ -111,32 +107,112 @@ static void kernel(const __grid_constant__ globals G) {
 
     // Allocate shared memory
     static_assert(
-        sizeof(globals::Q_tile) * config::NUM_CONSUMERS +
-        sizeof(globals::K_tile) * globals::PIPELINE_STAGES +
-        sizeof(globals::V_tile) * globals::PIPELINE_STAGES +
-        sizeof(globals::L_vec) * config::NUM_CONSUMERS +
-        sizeof(globals::A_tile) * config::NUM_CONSUMERS <= config::DYNAMIC_SHARED_MEMORY
+        sizeof(globals::Q_tile) * globals::NUM_PIPELINES +   // 65536 B
+        sizeof(globals::K_tile) * globals::PIPELINE_STAGES + // 49152 B
+        sizeof(globals::V_tile) * globals::PIPELINE_STAGES + // 49152 B
+        sizeof(globals::L_vec) * globals::NUM_PIPELINES <=   // 1024  B
+        config::DYNAMIC_SHARED_MEMORY
     );
-    globals::Q_tile (&Q_smem)[config::NUM_CONSUMERS]    = sm_allocator.allocate<globals::Q_tile, config::NUM_CONSUMERS>();
+    globals::Q_tile (&Q_smem)[globals::NUM_PIPELINES]    = sm_allocator.allocate<globals::Q_tile, globals::NUM_PIPELINES>();
     globals::K_tile (&K_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::K_tile, globals::PIPELINE_STAGES>();
     globals::V_tile (&V_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::V_tile, globals::PIPELINE_STAGES>();
-    globals::L_vec  (&L_smem)[config::NUM_CONSUMERS]    = sm_allocator.allocate<globals::L_vec, config::NUM_CONSUMERS>();
-    globals::O_tile (&O_smem)[config::NUM_CONSUMERS]    = *reinterpret_cast<globals::O_tile(*)[config::NUM_CONSUMERS]>(&Q_smem[0]);
-    globals::A_tile (&A_smem)[config::NUM_CONSUMERS]    = sm_allocator.allocate<globals::A_tile, config::NUM_CONSUMERS>();
+    globals::L_vec  (&L_smem)[globals::NUM_PIPELINES]    = sm_allocator.allocate<globals::L_vec, globals::NUM_PIPELINES>();
+    globals::O_tile (&O_smem)[globals::NUM_PIPELINES]    = *reinterpret_cast<globals::O_tile(*)[globals::NUM_PIPELINES]>(&Q_smem[0]);
 
     // Allocate tensor memory
     tensor_allocator<1, config::CLUSTER_SIZE> tm_allocator {};
-    using tm_t = tt<float, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
-    tm_t QK_tm[2] = {
-        tm_allocator.allocate<tm_t>(globals::BLOCK_SIZE * 0),
-        tm_allocator.allocate<tm_t>(globals::BLOCK_SIZE * 1)
-    };
-    tm_t AV_tm[2] = {
-        tm_allocator.allocate<tm_t>(globals::BLOCK_SIZE * 2),
-        tm_allocator.allocate<tm_t>(globals::BLOCK_SIZE * 3)
-    };
+    using tm_fl_t = tt<float, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
+    using tm_bf_t = tt<bf16, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
 
     // Set up mbarriers
+    if (threadIdx.x == 0) {
+    }
+    everyone::tma::cluster::sync();
+
+    // Pipeline configuration
+    const int cluster_id = clusterIdx().x;
+    const int cta_id = cluster_ctarank();
+    const int warp_id = ::warpid();
+    const int lane_id = warp::laneid();
+
+    if (warp_id < 8) { // 2 softmax groups
+        const int pipeline_id = warpgroup::groupid();
+
+    } else if (warp_id < 12) { // O rescale group
+
+    } else if (warp_id == 12 && lane_id == 0) {
+        for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
+            globals::task_info task_info = get_task_info(G, task_idx);
+            if (task_info.batch_idx == -1) break;
+            for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
+
+            }
+        }
+    } else if (warp_id == 13 && lane_id == 0) {
+
+    } else if (warp_id == 14 && lane_id == 0) {
+
+    } else if (warp_id == 15 && lane_id == 0) {
+
+    }
+
+
+
+        tma::cluster::expect(Q_arrived, 0, Q_smem[consumer_id]);
+        tma::cluster::load_async(Q_smem[consumer_id], G.Q,
+                                 {task_info.batch_idx, task_info.head_idx, 
+                                  2 * config::NUM_CONSUMERS * task_info.Q_block_idx + 
+                                  config::NUM_CONSUMERS * cta_id + consumer_id, 0},
+                                 Q_arrived, (uint16_t)(1 << cta_id), 0);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     __shared__ semaphore Q_arrived;
     __shared__ semaphore K_arrived[globals::PIPELINE_STAGES];
     __shared__ semaphore V_arrived[globals::PIPELINE_STAGES];
@@ -163,16 +239,33 @@ static void kernel(const __grid_constant__ globals G) {
             init_semaphore(AV_finished[i], 0, 1);
         }
     }
-    everyone::tma::cluster::sync();
 
-    // Pipeline configuration
-    const int cluster_id = clusterIdx().x;
-    const int cta_id = cluster_ctarank();
+
+
+
+
+
+
+
+    
 
     // Constants
     constexpr float SQRT_D_INV = 0.08838834764f; // 1 / sqrt(128)
     constexpr float NEG_SQRT_D = -11.313708499f; // -sqrt(128)
     constexpr float LOG2E = 1.44269504089f;
+
+    tm_fl_t S_tm[2] = {
+        tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 0),
+        tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 1)
+    };
+    tm_bf_t P_tm[2] = { // overlaps with S_tm
+        tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE * 0),
+        tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE * 1)
+    }
+    tm_fl_t O_tm[2] = {
+        tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 2),
+        tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 3)
+    };
 
     // Main divergence
     if (warpgroup::groupid() == config::NUM_WARPGROUPS - 1) {
@@ -190,7 +283,6 @@ static void kernel(const __grid_constant__ globals G) {
             for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
                 globals::task_info task_info = get_task_info(G, task_idx);
                 if (task_info.batch_idx == -1) break;
-
                 for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
                     wait(K_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
