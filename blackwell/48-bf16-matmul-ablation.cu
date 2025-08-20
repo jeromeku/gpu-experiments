@@ -24,6 +24,15 @@
     Observations:
       - chopping C_smem into pieces do not affect perf, only gives us more SMEM!
       - number of stages does matter a lot. it usually peaks at 4
+
+    Lesson:
+      - I used to think I use utilize the *entire* TMEM all the time to hit max TFLOPs
+      - But this only gives 2~3% benefit, which is good to have if possible, but not worth sacrificing other perf bottlenecks
+      - General think frame (on 2-CTA):
+        - Using 128x512 gives ~1600 TFLOP/s (*Since this is 2-CTA, this means 256x512 across 2 CTAs, similar for below)
+        - Using 128x256 gives ~1520 TFLOP/s
+        - Using 128x128 gives ~1350 TFLOP/s
+      - The last bit is using 1/4 TMEM per CTA. So no need to fuss over using full TMEM all the time!
 */
 
 #include "kittens.cuh"
