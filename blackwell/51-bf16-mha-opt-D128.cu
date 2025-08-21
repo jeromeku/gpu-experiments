@@ -90,7 +90,7 @@ struct rescale_add {
         if constexpr (std::is_same_v<T, float2>) {
             constexpr float2 scale = {1.44269504089f*0.08838834764f, 1.44269504089f*0.08838834764f};
             float2 c;
-            asm volatile("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(*(uint64_t*)&c) : "l"(*(uint64_t*)&a), "l"(*(uint64_t*)&scale), "l"(*(uint64_t*)&b));
+            asm volatile("{fma.rn.f32x2 %0, %1, %2, %3;}" : "=l"(*(uint64_t*)&c) : "l"(*(uint64_t*)&a), "l"(*(uint64_t*)&scale), "l"(*(uint64_t*)&b));
             return c;
         }
         else {
@@ -140,11 +140,63 @@ static void kernel(const __grid_constant__ globals G) {
 
     } else if (warp_id < 12) { // O rescale group
 
-    } else if (warp_id == 12 && lane_id == 0) {
+    } else if (warp_id == 12 && lane_id == 0) { // Loader group
         for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
             globals::task_info task_info = get_task_info(G, task_idx);
             if (task_info.batch_idx == -1) break;
+
+            #pragma unroll
+            for (int id = 0; id < 2; id++) {
+                tma::cluster::expect(Q_finished, 0, Q_smem[id]);
+                tma::cluster::load_async(Q_smem[id], G.Q,
+                                         {task_info.batch_idx, task_info.head_idx, 
+                                         2 * globals::NUM_PIPELINES * task_info.Q_block_idx + 
+                                         globals::NUM_PIPELINES * cta_id + id, 0},
+                                         Q_finished, (uint16_t)(1 << cta_id), 0);
+            }
+
             for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
+                wait(K_finished[stage], get_phasebit<1>(phasebits, stage));
+                update_phasebit<1>(phasebits, stage);
+
+                tma::cluster::expect(K_arrived[stage], 0, K_smem[stage]);
+                tma::cluster::load_async(K_smem[stage], G.K, 
+                                         {task_info.batch_idx, task_info.head_idx, 2 * i + cta_id, 0},
+                                         K_arrived[stage], (uint16_t)(1 << cta_id), 0);
+
+                stage = (stage + 1) % globals::PIPELINE_STAGES;
+            }
+
+
+
+
+
+
+
+
+
+
+
+
+        } else if (warp_id == 1 && lane_id == 0) {
+            // V loader
+            for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
+                globals::task_info task_info = get_task_info(G, task_idx);
+                if (task_info.batch_idx == -1) break;
+
+                for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
+                    wait(V_finished[stage], get_phasebit<1>(phasebits, stage));
+                    update_phasebit<1>(phasebits, stage);
+
+                    tma::cluster::expect(V_arrived[stage], 0, V_smem[stage]);
+                    tma::cluster::load_async(V_smem[stage], G.V, 
+                                             {task_info.batch_idx, task_info.head_idx, i, cta_id},
+                                             V_arrived[stage], (uint16_t)(1 << cta_id), 0);
+
+                    stage = (stage + 1) % globals::PIPELINE_STAGES;
+                }
+            }
+
 
             }
         }
@@ -158,12 +210,6 @@ static void kernel(const __grid_constant__ globals G) {
 
 
 
-        tma::cluster::expect(Q_arrived, 0, Q_smem[consumer_id]);
-        tma::cluster::load_async(Q_smem[consumer_id], G.Q,
-                                 {task_info.batch_idx, task_info.head_idx, 
-                                  2 * config::NUM_CONSUMERS * task_info.Q_block_idx + 
-                                  config::NUM_CONSUMERS * cta_id + consumer_id, 0},
-                                 Q_arrived, (uint16_t)(1 << cta_id), 0);
 
 
 
@@ -279,40 +325,6 @@ static void kernel(const __grid_constant__ globals G) {
         uint32_t phasebits = 0xFFFF0000;
 
         if (warp_id == 0 && lane_id == 0) {
-            // K loader
-            for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
-                globals::task_info task_info = get_task_info(G, task_idx);
-                if (task_info.batch_idx == -1) break;
-                for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
-                    wait(K_finished[stage], get_phasebit<1>(phasebits, stage));
-                    update_phasebit<1>(phasebits, stage);
-
-                    tma::cluster::expect(K_arrived[stage], 0, K_smem[stage]);
-                    tma::cluster::load_async(K_smem[stage], G.K, 
-                                             {task_info.batch_idx, task_info.head_idx, 2 * i + cta_id, 0},
-                                             K_arrived[stage], (uint16_t)(1 << cta_id), 0);
-
-                    stage = (stage + 1) % globals::PIPELINE_STAGES;
-                }
-            }
-        } else if (warp_id == 1 && lane_id == 0) {
-            // V loader
-            for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
-                globals::task_info task_info = get_task_info(G, task_idx);
-                if (task_info.batch_idx == -1) break;
-
-                for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
-                    wait(V_finished[stage], get_phasebit<1>(phasebits, stage));
-                    update_phasebit<1>(phasebits, stage);
-
-                    tma::cluster::expect(V_arrived[stage], 0, V_smem[stage]);
-                    tma::cluster::load_async(V_smem[stage], G.V, 
-                                             {task_info.batch_idx, task_info.head_idx, i, cta_id},
-                                             V_arrived[stage], (uint16_t)(1 << cta_id), 0);
-
-                    stage = (stage + 1) % globals::PIPELINE_STAGES;
-                }
-            }
         } else if (cta_id == 0 && warp_id == 2 && lane_id == 0) {
             // QK launcher
             for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
@@ -373,16 +385,6 @@ static void kernel(const __grid_constant__ globals G) {
         for (int task_idx = cluster_id; true; task_idx += gridDim.x / 2) {
             globals::task_info task_info = get_task_info(G, task_idx);
             if (task_info.batch_idx == -1) break;
-
-            // Load Q
-            if (consumer::laneid() == 0) {
-                tma::cluster::expect(Q_arrived, 0, Q_smem[consumer_id]);
-                tma::cluster::load_async(Q_smem[consumer_id], G.Q,
-                                         {task_info.batch_idx, task_info.head_idx, 
-                                          2 * config::NUM_CONSUMERS * task_info.Q_block_idx + 
-                                          config::NUM_CONSUMERS * cta_id + consumer_id, 0},
-                                         Q_arrived, (uint16_t)(1 << cta_id), 0);
-            }
 
             rt_fl<ROWS_PER_WARP, globals::VO_DIM> O_reg;
             col_vec<rt_fl<ROWS_PER_WARP, globals::BLOCK_SIZE>> max_vec, norm_vec;
