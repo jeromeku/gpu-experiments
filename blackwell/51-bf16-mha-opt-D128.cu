@@ -14,8 +14,8 @@ struct config {
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
 
-    static constexpr int NUM_WARPGROUPS = 4;
-    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_WARPGROUPS = 4; // 8 softmax + 4 scaling & epilogue + 1 TMA + 1 MMA + 2 unused
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS; 
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
     static constexpr int PRODUCER_REGISTERS = 64;
@@ -31,11 +31,12 @@ struct globals {
     static constexpr int PIPELINE_STAGES = 3;
     static constexpr int NUM_PIPELINES = 2;
 
-    using Q_tile = st_bf<BLOCK_SIZE, QK_DIM>;          // 32768 B
-    using K_tile = st_bf<BLOCK_SIZE / 2, QK_DIM>;      // 16384 B
-    using V_tile = st_bf<BLOCK_SIZE, VO_DIM / 2>;      // 16384 B
-    using L_vec  = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>; // 512   B
-    using O_tile = st_bf<BLOCK_SIZE, VO_DIM>;          // 32768 B
+    using Q_tile = st_bf<BLOCK_SIZE, QK_DIM>;              // 32768 B
+    using K_tile = st_bf<BLOCK_SIZE / 2, QK_DIM>;          // 16384 B
+    using V_tile = st_bf<BLOCK_SIZE, VO_DIM / 2>;          // 16384 B
+    using M_vec  = col_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>; // 512   B
+    using L_vec  = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>;     // 512   B
+    using O_tile = st_bf<BLOCK_SIZE, VO_DIM>;              // 32768 B
 
     using Q_gl = gl<bf16,  -1, -1, -1, -1, Q_tile>; // B, H, N, D
     using K_gl = gl<bf16,  -1, -1, -1, -1, K_tile>;
@@ -110,19 +111,22 @@ static void kernel(const __grid_constant__ globals G) {
         sizeof(globals::Q_tile) * globals::NUM_PIPELINES +   // 65536 B
         sizeof(globals::K_tile) * globals::PIPELINE_STAGES + // 49152 B
         sizeof(globals::V_tile) * globals::PIPELINE_STAGES + // 49152 B
-        sizeof(globals::L_vec) * globals::NUM_PIPELINES <=   // 1024  B
+        sizeof(globals::L_vec) * globals::NUM_PIPELINES +    // 1024  B
+        sizeof(globals::M_vec) * globals::NUM_PIPELINES <=   // 1024  B
         config::DYNAMIC_SHARED_MEMORY
     );
-    globals::Q_tile (&Q_smem)[globals::NUM_PIPELINES]    = sm_allocator.allocate<globals::Q_tile, globals::NUM_PIPELINES>();
+    globals::Q_tile (&Q_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::Q_tile, globals::NUM_PIPELINES>();
     globals::K_tile (&K_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::K_tile, globals::PIPELINE_STAGES>();
     globals::V_tile (&V_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::V_tile, globals::PIPELINE_STAGES>();
-    globals::L_vec  (&L_smem)[globals::NUM_PIPELINES]    = sm_allocator.allocate<globals::L_vec, globals::NUM_PIPELINES>();
-    globals::O_tile (&O_smem)[globals::NUM_PIPELINES]    = *reinterpret_cast<globals::O_tile(*)[globals::NUM_PIPELINES]>(&Q_smem[0]);
+    globals::L_vec  (&L_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::L_vec, globals::NUM_PIPELINES>();
+    globals::L_vec  (&M_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::M_vec, globals::NUM_PIPELINES>();
+    globals::O_tile (&O_smem)[globals::NUM_PIPELINES]   = *reinterpret_cast<globals::O_tile(*)[globals::NUM_PIPELINES]>(&Q_smem[0]);
 
     // Allocate tensor memory
     tensor_allocator<1, config::CLUSTER_SIZE> tm_allocator {};
     using tm_fl_t = tt<float, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
     using tm_bf_t = tt<bf16, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
+    using tm_chunk_bf_t = tt<bf16, globals::BLOCK_SIZE, globals::BLOCK_SIZE / 4>;
 
     // Set up mbarriers
     __shared__ semaphore Q_arrived;
@@ -132,12 +136,18 @@ static void kernel(const __grid_constant__ globals G) {
     __shared__ semaphore V_arrived[globals::PIPELINE_STAGES];
     __shared__ semaphore V_finished[globals::PIPELINE_STAGES];
     __shared__ semaphore S_arrived[globals::NUM_PIPELINES];
+    __shared__ semaphore S_finished;
     __shared__ semaphore P_arrived[globals::NUM_PIPELINES];
     __shared__ semaphore O_arrived[globals::NUM_PIPELINES];
     __shared__ semaphore O_scaled[globals::NUM_PIPELINES];
+    __shared__ semaphore M_arrived[globals::NUM_PIPELINES];
+    __shared__ semaphore M_finished[globals::NUM_PIPELINES];
+    __shared__ semaphore L_arrived[globals::NUM_PIPELINES];
+    __shared__ semaphore L_finished[globals::NUM_PIPELINES];
     if (threadIdx.x == 0) {
         init_semaphore(Q_arrived, 0, config::CLUSTER_SIZE);
         init_semaphore(Q_finished, 0, globals::NUM_PIPELINES);
+        init_semaphore(S_finished, 0, 1);
         #pragma unroll
         for (int i = 0; i < globals::PIPELINE_STAGES; ++i) {
             init_semaphore(K_arrived[i], 0, config::CLUSTER_SIZE);
@@ -151,6 +161,10 @@ static void kernel(const __grid_constant__ globals G) {
             init_semaphore(P_arrived[i], 0, config::CLUSTER_SIZE);
             init_semaphore(O_arrived[i], 0, 1);
             init_semaphore(O_scaled[i], 0, config::CLUSTER_SIZE);
+            init_semaphore(M_arrived[i], 0, WARPGROUP_WARPS * WARP_THREADS);
+            init_semaphore(M_finished[i], 0, 1);
+            init_semaphore(L_arrived[i], 0, 1);
+            init_semaphore(L_finished[i], 0, 1);
         }
     }
     everyone::tma::cluster::sync();
@@ -160,7 +174,8 @@ static void kernel(const __grid_constant__ globals G) {
     const int cta_id = cluster_ctarank();
     const int warp_id = ::warpid();
     const int lane_id = warp::laneid();
-    uint32_t stage = 0;
+    uint32_t QK_stage = 0;
+    uint32_t PV_stage = 0;
     uint32_t phasebits = 0xFFFF'0000;
 
     // Constants
@@ -169,50 +184,122 @@ static void kernel(const __grid_constant__ globals G) {
     constexpr float LOG2E = 1.44269504089f;
 
     if (warp_id < 8) { // 2 softmax groups
+        // warpgroup::increase_registers<176>();
+
         const int pipeline_id = warpgroup::groupid();
 
-        tm_fl_t S_tm = tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * pipeline_id);
-        tm_bf_t P_tm = tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE * pipeline_id);
+        tm_fl_t S_tm = tm_allocator.allocate<tm_fl_t>(0);
+        tm_chunk_bf_t P_tm = tm_allocator.allocate<tm_chunk_bf_t>(globals::BLOCK_SIZE + (globals::BLOCK_SIZE / 2) * pipeline_id);
 
         for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
             globals::task_info task_info = get_task_info(G, task_idx);
             if (task_info.batch_idx == -1) break;
 
-            col_vec<rt_fl<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::BLOCK_SIZE>> max_vec, norm_vec;
-            warp::neg_infty(max_vec);
-            warp::zero(norm_vec);
+            float row_max = 0xFF800000; // -inf
+            float row_sum = 0.f;
 
             for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
                 tma::cluster::wait(S_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
                 update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
-                warpgroup::arrive(K_finished[stage]);
-                stage = (stage + 1) % globals::PIPELINE_STAGES;
+                warpgroup::arrive(K_finished[QK_stage]);
+                QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
 
-                rt_fl<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::BLOCK_SIZE> SP_reg;
-                warpgroup::load_async(SP_reg, S_tm);
-                tensor_load_wait();
+                if (i == task_info.KV_block_end - 1)
+                    warpgroup::arrive(Q_finished);
 
-                // Perform softmax
-                col_vec<rt_fl<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::BLOCK_SIZE>> max_vec_last_scaled, max_vec_scaled;
-                // warp::mul(max_vec_last_scaled, max_vec, LOG2E * SQRT_D_INV);
-                // warp::row_max(max_vec, SP_reg, max_vec);
-                // warp::mul(max_vec_scaled, max_vec, -LOG2E * SQRT_D_INV);
-                // warp::row_map<rescale_add>(SP_reg, SP_reg, max_vec_scaled);
-                // warp::exp2(SP_reg, SP_reg);
-                // warp::add(max_vec_last_scaled, max_vec_scaled, max_vec_last_scaled);
-                // warp::exp2(max_vec_last_scaled, max_vec_last_scaled);
-                // warp::mul(norm_vec, max_vec_last_scaled, norm_vec);
-                // warp::row_sum(norm_vec, SP_reg, norm_vec);
+                // TMEM --> registers
+                float2 SP_reg[globals::BLOCK_SIZE / 2];
+                #pragma unroll
+                for (int ii = 0; ii < globals::BLOCK_SIZE / 32; ii++) {
+                    asm volatile("{tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];}"
+                        : "=f"(SP_reg[ii * 16 + 0].x), "=f"(SP_reg[ii * 16 + 0].y), "=f"(SP_reg[ii * 16 + 1].x), "=f"(SP_reg[ii * 16 + 1].y), "=f"(SP_reg[ii * 16 + 2].x), "=f"(SP_reg[ii * 16 + 2].y), "=f"(SP_reg[ii * 16 + 3].x), "=f"(SP_reg[ii * 16 + 3].y), 
+                          "=f"(SP_reg[ii * 16 + 4].x), "=f"(SP_reg[ii * 16 + 4].y), "=f"(SP_reg[ii * 16 + 5].x), "=f"(SP_reg[ii * 16 + 5].y), "=f"(SP_reg[ii * 16 + 6].x), "=f"(SP_reg[ii * 16 + 6].y), "=f"(SP_reg[ii * 16 + 7].x), "=f"(SP_reg[ii * 16 + 7].y),
+                          "=f"(SP_reg[ii * 16 + 8].x), "=f"(SP_reg[ii * 16 + 8].y), "=f"(SP_reg[ii * 16 + 9].x), "=f"(SP_reg[ii * 16 + 9].y), "=f"(SP_reg[ii * 16 + 10].x), "=f"(SP_reg[ii * 16 + 10].y), "=f"(SP_reg[ii * 16 + 11].x), "=f"(SP_reg[ii * 16 + 11].y),
+                          "=f"(SP_reg[ii * 16 + 12].x), "=f"(SP_reg[ii * 16 + 12].y), "=f"(SP_reg[ii * 16 + 13].x), "=f"(SP_reg[ii * 16 + 13].y), "=f"(SP_reg[ii * 16 + 14].x), "=f"(SP_reg[ii * 16 + 14].y), "=f"(SP_reg[ii * 16 + 15].x), "=f"(SP_reg[ii * 16 + 15].y)
+                        : "r"(S_tm.addr + ii * 32));
+                }
+                float last_row_max_scaled = row_max * (LOG2E * SQRT_D_INV);
+                asm volatile("{tcgen05.wait::ld.sync.aligned;}");
+                warpgroup::arrive(S_finished);
 
-                // Move P to TMEM
-                // rt_bf<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::BLOCK_SIZE> P_bf_reg;
-                // warp::copy(P_bf_reg, SP_reg);
-                // warpgroup::store_async(P_tm, P_bf_reg);
-                // tensor_store_wait();
+                // Row-wise max
+                #pragma unroll
+                for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ii++) {
+                    asm volatile("{max.f32 %0, %1, %2, %3;}"
+                        : "=f"(row_max)
+                        : "f"(row_max), "f"(SP_reg[ii].x), "f"(SP_reg[ii].y));
+                }
+
+                // Prepare scales
+                float S_scale = row_max * (-LOG2E * SQRT_D_INV);
+                float O_scale = last_row_max_scaled + S_scale;
+
+                // Send O scale to correction group
+                if (i > task_info.KV_block_start) {
+                    wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                    update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
+                    M_smem[pipeline_id][warpgroup::laneid()] = O_scale;
+                    arrive(M_arrived[pipeline_id]);
+                }
+
+                // Prepare S scales
+                float2 S_scale_2 = {S_scale, S_scale};
+                constexpr float2 log_scale_2 = {LOG2E * SQRT_D_INV, LOG2E * SQRT_D_INV};
+
+                #pragma unroll
+                for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ii++) {
+                    SP_reg[ii] = __ffma2_rn(SP_reg[ii], log_scale_2, S_scale_2);
+                    SP_reg[ii].x = exp2f(SP_reg[ii].x);
+                    SP_reg[ii].y = exp2f(SP_reg[ii].y);
+                }
+
+                // Scaling + exp2 + registers --> TMEM
+                #pragma unroll
+                for (int ii = 0; ii < globals::BLOCK_SIZE / 32; ii++) {
+                    bf16_2 SP_bf_reg[16];
+                    #pragma unroll
+                    for (int jj = 0; jj < 16; jj++) {
+                        SP_bf_reg[jj] = __float22bfloat162_rn(SP_reg[ii * 16 + jj]);
+                    }
+                    asm volatile("{tcgen05.st.sync.aligned.32x32b.x16.b32 [%16], {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15};}"
+                        :: "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[0])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[1])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[2])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[3])),
+                           "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[4])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[5])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[6])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[7])),
+                           "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[8])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[9])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[10])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[11])),
+                           "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[12])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[13])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[14])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[15]))
+                           "r"(P_tm.addr + ii * 16));
+                }
+
+                // Signal PV launcher
+                asm volatile("{tcgen05.wait::st.sync.aligned;}");
+                warpgroup::sync(pipeline_id + 1);
                 warpgroup::tma::cluster::arrive(P_arrived[pipeline_id], 0);
+
+                // Get row-wise sum
+                float2 local_sum = {0.0f, 0.0f};
+                #pragma unroll
+                for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ii++) {
+                    local_sum = __fadd2_rn(local_sum, SP_reg[ii]);
+                }
+                row_sum *= exp2f(O_scale); // scale previous sum
+                row_sum += local_sum.x + local_sum.y;
+            }
+
+            // Save for epilogue
+            if (task_info.KV_block_start < task_info.KV_block_end) {
+                // Send O scale to correction group
+                wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
+                // wait(L_finished[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES + 1);
+                // update_phasebit<1>(phasebits, globals::PIPELINE_STAGES + 1);
+                M_smem[pipeline_id][warpgroup::laneid()] = row_max;
+                L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
+                arrive(M_arrived[pipeline_id]);
+                // arrive(L_arrived[pipeline_id]);
             }
         }
-    } else if (warp_id < 12) { // O rescale group
+    } else if (warp_id < 12) { // Scale & epilogue group
+        // warpgroup::decrease_registers<48>();
+
         tm_fl_t O_tm[globals::NUM_PIPELINES] = {
             tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * (globals::NUM_PIPELINES + 0)),
             tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * (globals::NUM_PIPELINES + 1))
@@ -225,183 +312,217 @@ static void kernel(const __grid_constant__ globals G) {
             for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
                 #pragma unroll
                 for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
-                    if (i > task_info.KV_block_start) {
-                        tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<0>(phasebits, pipeline_id));
-                        update_phasebit<0>(phasebits, pipeline_id);
-                        warpgroup::arrive(V_finished[stage]);
-                        stage = (stage + 1) % globals::PIPELINE_STAGES;
-    
-                        // rt_fl<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::VO_DIM> O_reg;
-                        // warpgroup::load_async(O_reg, O_tm[pipeline_id]);
-                        // // warp::mul_row(O_reg, O_reg, max_vec_last_scaled);
-                        // warpgroup::store_async(O_tm[pipeline_id], O_reg);
-                        // tensor_store_wait();
-                        // warpgroup::sync(1 + pipeline_id);
-                    }
-                    warpgroup::tma::cluster::arrive(O_scaled[pipeline_id], 0);
-                }
-            }
+                    warpgroup::tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                    warpgroup::arrive(V_finished[PV_stage]);
 
-            // Wait for the last PV MMA
-            #pragma unroll
-            for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
-                tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<0>(phasebits, pipeline_id));
-                update_phasebit<0>(phasebits, pipeline_id);
-                warpgroup::arrive(V_finished[stage]);
-                stage = (stage + 1) % globals::PIPELINE_STAGES;
+                    if (i == task_info.KV_block_start)
+                        continue; // no need to scale the first O
 
-                rt_fl<globals::BLOCK_SIZE / WARPGROUP_WARPS, globals::VO_DIM> O_reg;
-                warpgroup::load_async(O_reg, O_tm[pipeline_id]);
-                // warp::div_row(O_reg, O_reg, norm_vec);
-                warpgroup::store(O_smem[pipeline_id], O_reg);
-                warpgroup::sync(pipeline_id + 1);
-                warpgroup::tma::store_async(G.O, O_smem[pipeline_id], 
-                                            {task_info.batch_idx, task_info.head_idx, 
-                                            config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx + 
-                                            globals::NUM_PIPELINES * cta_id + pipeline_id, 0});
-                warpgroup::tma::store_async_read_wait();
-                warpgroup::arrive(Q_finished);
+                    float2 O_scale_2;
 
-                // warp::mul(max_vec, max_vec, SQRT_D_INV);
-                // warp::log(norm_vec, norm_vec);
-                // warp::add(norm_vec, norm_vec, max_vec);
-                // warp::mul(norm_vec, norm_vec, NEG_SQRT_D);
+                    #pragma unroll
+                    for (int ii = 0; ii < 4; ++ii) {
+                        float2 O_reg[globals::BLOCK_SIZE / 4 / 2];
+                        asm volatile("{tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];}"
+                            : "=f"(O_reg[ii * 16 + 0].x), "=f"(O_reg[ii * 16 + 0].y), "=f"(O_reg[ii * 16 + 1].x), "=f"(O_reg[ii * 16 + 1].y), "=f"(O_reg[ii * 16 + 2].x), "=f"(O_reg[ii * 16 + 2].y), "=f"(O_reg[ii * 16 + 3].x), "=f"(O_reg[ii * 16 + 3].y), 
+                              "=f"(O_reg[ii * 16 + 4].x), "=f"(O_reg[ii * 16 + 4].y), "=f"(O_reg[ii * 16 + 5].x), "=f"(O_reg[ii * 16 + 5].y), "=f"(O_reg[ii * 16 + 6].x), "=f"(O_reg[ii * 16 + 6].y), "=f"(O_reg[ii * 16 + 7].x), "=f"(O_reg[ii * 16 + 7].y),
+                              "=f"(O_reg[ii * 16 + 8].x), "=f"(O_reg[ii * 16 + 8].y), "=f"(O_reg[ii * 16 + 9].x), "=f"(O_reg[ii * 16 + 9].y), "=f"(O_reg[ii * 16 + 10].x), "=f"(O_reg[ii * 16 + 10].y), "=f"(O_reg[ii * 16 + 11].x), "=f"(O_reg[ii * 16 + 11].y),
+                              "=f"(O_reg[ii * 16 + 12].x), "=f"(O_reg[ii * 16 + 12].y), "=f"(O_reg[ii * 16 + 13].x), "=f"(O_reg[ii * 16 + 13].y), "=f"(O_reg[ii * 16 + 14].x), "=f"(O_reg[ii * 16 + 14].y), "=f"(O_reg[ii * 16 + 15].x), "=f"(O_reg[ii * 16 + 15].y)
+                            : "r"(O_tm[pipeline_id].addr + ii * 32));
 
-                // warpgroup::store(L_smem[pipeline_id], norm_vec);
-                warpgroup::sync(1 + pipeline_id);
-                warpgroup::tma::store_async(G.L, L_smem[pipeline_id], 
-                                    {task_info.batch_idx, task_info.head_idx, 0, 
-                                    config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx + 
-                                    globals::NUM_PIPELINES * cta_id + pipeline_id});
-                warpgroup::tma::store_async_read_wait();
-                warpgroup::sync(pipeline_id + 1);
-            }
-        }
-    } else if (warp_id == 12 && lane_id == 0) { // Loader group
-        for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
-            globals::task_info task_info = get_task_info(G, task_idx);
-            if (task_info.batch_idx == -1) break;
-
-            // Load Q
-            wait(Q_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
-            update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
-            tma::cluster::expect_bytes(Q_arrived, sizeof(globals::Q_tile) * globals::NUM_PIPELINES, 0);
-            #pragma unroll
-            for (int pipeline_id = 0; pipeline_id < 2; pipeline_id++) {
-                tma::cluster::load_async(Q_smem[pipeline_id], G.Q,
-                                         {task_info.batch_idx, task_info.head_idx, 
-                                         config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx + 
-                                         globals::NUM_PIPELINES * cta_id + pipeline_id, 0},
-                                         Q_arrived, (uint16_t)(1 << cta_id), 0);
-            }
-
-            // Stream K & V
-            for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
-                wait(K_finished[stage], get_phasebit<1>(phasebits, stage));
-                tma::cluster::expect(K_arrived[stage], 0, K_smem[stage]);
-                tma::cluster::load_async(K_smem[stage], G.K, 
-                                         {task_info.batch_idx, task_info.head_idx, 2 * i + cta_id, 0},
-                                         K_arrived[stage], (uint16_t)(1 << cta_id), 0);
-
-                wait(V_finished[stage], get_phasebit<1>(phasebits, stage));
-                tma::cluster::expect(V_arrived[stage], 0, V_smem[stage]);
-                tma::cluster::load_async(V_smem[stage], G.V, 
-                                         {task_info.batch_idx, task_info.head_idx, i, cta_id},
-                                         V_arrived[stage], (uint16_t)(1 << cta_id), 0);
-
-                update_phasebit<1>(phasebits, stage);
-                stage = (stage + 1) % globals::PIPELINE_STAGES;
-            }
-        }
-    } else if (warp_id == 13 && lane_id == 0 && cta_id == 0) { // MMA launcher group
-        tm_fl_t S_tm[globals::NUM_PIPELINES] = {
-            tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 0),
-            tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 1)
-        };
-        tm_bf_t P_tm[globals::NUM_PIPELINES] = { // overlaps with S_tm
-            tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE * 0),
-            tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE * 1)
-        };
-        tm_fl_t O_tm[globals::NUM_PIPELINES] = {
-            tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 2),
-            tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 3)
-        };
-
-        for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
-            globals::task_info task_info = get_task_info(G, task_idx);
-            if (task_info.batch_idx == -1) break;
-
-            tma::cluster::wait(Q_arrived, get_phasebit<0>(phasebits, globals::PIPELINE_STAGES + globals::NUM_PIPELINES));
-            update_phasebit<0>(phasebits, globals::PIPELINE_STAGES + globals::NUM_PIPELINES);
-
-            for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
-                // Launch S = QK^T
-                tma::cluster::wait(K_arrived[stage], get_phasebit<0>(phasebits, stage));
-                #pragma unroll
-                for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
-                    tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES + pipeline_id));
-                    mm2_ABt(S_tm[pipeline_id], Q_smem[pipeline_id], K_smem[stage], S_arrived[pipeline_id]);
-                }
-
-                // Launch O = PV
-                tma::cluster::wait(V_arrived[stage], get_phasebit<0>(phasebits, stage));
-                #pragma unroll
-                for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
-                    tma::cluster::wait(P_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES + pipeline_id));
-                    tma::cluster::wait(O_scaled[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES + pipeline_id));
-                    {
-                        constexpr int trans_b = 0;
-                        constexpr int M = globals::BLOCK_SIZE * config::CLUSTER_SIZE;                    
-                        constexpr int K = globals::BLOCK_SIZE;
-                        constexpr int N = globals::VO_DIM;                    
-                        constexpr int red_dim = 16; // fixed for BF16
-                        using B_type = globals::V_tile;
-
-                        uint32_t idesc = kittens::detail::tcgen05::instruction_descriptor<float, bf16, M, N, 0, trans_b, false>();
-                        st_descriptor<ducks::st_descriptor::detail::get_st<B_type>, trans_b> b_desc(V_smem[stage]);
-                        asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
-
-                        if (i == task_info.KV_block_start)
-                            kittens::detail::tcgen05::template tt_st<bf16, 0, config::CLUSTER_SIZE>(
-                                O_tm[pipeline_id].addr,
-                                P_tm[pipeline_id].template chunk_addr<0>(0),
-                                b_desc.chunk_descriptor(0),
-                                idesc
-                            );
-                        else
-                        kittens::detail::tcgen05::template tt_st<bf16, 1, config::CLUSTER_SIZE>(
-                            O_tm[pipeline_id].addr,
-                            P_tm[pipeline_id].template chunk_addr<0>(0),
-                            b_desc.chunk_descriptor(0),
-                            idesc
-                        );
-                        #pragma unroll
-                        for(int i = 1; i < K / red_dim; i++) {
-                            kittens::detail::tcgen05::template tt_st<bf16, 1, config::CLUSTER_SIZE>(
-                                O_tm[pipeline_id].addr,
-                                P_tm[pipeline_id].template chunk_addr<0>(i),
-                                b_desc.chunk_descriptor(i),
-                                idesc
-                            );
+                        if (ii == 0) {
+                            wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                            O_scale_2.x = exp2f(M_smem[pipeline_id][warpgroup::laneid()]);
+                            O_scale_2.y = O_scale_2.x;
                         }
-                        kittens::detail::tcgen05::commit<config::CLUSTER_SIZE>(O_arrived[pipeline_id]);
+
+                        #pragma unroll
+                        for (int jj = 0; jj < globals::BLOCK_SIZE / 4 / 2; jj++) {
+                            O_reg[jj] = __fmul2_rn(O_reg[jj], O_scale_2);
+                        }
+
+                        asm volatile("{tcgen05.st.sync.aligned.32x32b.x32.b32 [%32], {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31};}"
+                            :: "f"(O_reg[ii * 16 + 0].x), "f"(O_reg[ii * 16 + 0].y), "f"(O_reg[ii * 16 + 1].x), "f"(O_reg[ii * 16 + 1].y), "f"(O_reg[ii * 16 + 2].x), "f"(O_reg[ii * 16 + 2].y), "f"(O_reg[ii * 16 + 3].x), "f"(O_reg[ii * 16 + 3].y), 
+                               "f"(O_reg[ii * 16 + 4].x), "f"(O_reg[ii * 16 + 4].y), "f"(O_reg[ii * 16 + 5].x), "f"(O_reg[ii * 16 + 5].y), "f"(O_reg[ii * 16 + 6].x), "f"(O_reg[ii * 16 + 6].y), "f"(O_reg[ii * 16 + 7].x), "f"(O_reg[ii * 16 + 7].y),
+                               "f"(O_reg[ii * 16 + 8].x), "f"(O_reg[ii * 16 + 8].y), "f"(O_reg[ii * 16 + 9].x), "f"(O_reg[ii * 16 + 9].y), "f"(O_reg[ii * 16 + 10].x), "f"(O_reg[ii * 16 + 10].y), "f"(O_reg[ii * 16 + 11].x), "f"(O_reg[ii * 16 + 11].y),
+                               "f"(O_reg[ii * 16 + 12].x), "f"(O_reg[ii * 16 + 12].y), "f"(O_reg[ii * 16 + 13].x), "f"(O_reg[ii * 16 + 13].y), "f"(O_reg[ii * 16 + 14].x), "f"(O_reg[ii * 16 + 14].y), "f"(O_reg[ii * 16 + 15].x), "f"(O_reg[ii * 16 + 15].y)
+                               "r"(O_tm[pipeline_id].addr + ii * 32));
                     }
+
+                    asm volatile("{tcgen05.wait::st.sync.aligned;}");
+                    warpgroup::sync(3);
+                    warpgroup::tma::cluster::arrive(O_scaled[pipeline_id], 0);
+                    warpgroup::arrive(M_finished[pipeline_id]);
                 }
 
-                // Step
+                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
+                PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
+            }
+
+            // Epilogue
+            if (task_info.KV_block_start < task_info.KV_block_end) {
                 #pragma unroll
                 for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
-                    update_phasebit<0>(phasebits, globals::PIPELINE_STAGES + pipeline_id);
-                    update_phasebit<1>(phasebits, globals::PIPELINE_STAGES + pipeline_id);
+                    warpgroup::tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                    warpgroup::arrive(V_finished[PV_stage]);
+
+                    float row_max;
+                    float row_sum;
+
+                    #pragma unroll
+                    for (int ii = 0; ii < 4; ++ii) {
+                        float2 O_reg[globals::BLOCK_SIZE / 4 / 2];
+                        asm volatile("{tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];}"
+                            : "=f"(O_reg[ii * 16 + 0].x), "=f"(O_reg[ii * 16 + 0].y), "=f"(O_reg[ii * 16 + 1].x), "=f"(O_reg[ii * 16 + 1].y), "=f"(O_reg[ii * 16 + 2].x), "=f"(O_reg[ii * 16 + 2].y), "=f"(O_reg[ii * 16 + 3].x), "=f"(O_reg[ii * 16 + 3].y), 
+                            "=f"(O_reg[ii * 16 + 4].x), "=f"(O_reg[ii * 16 + 4].y), "=f"(O_reg[ii * 16 + 5].x), "=f"(O_reg[ii * 16 + 5].y), "=f"(O_reg[ii * 16 + 6].x), "=f"(O_reg[ii * 16 + 6].y), "=f"(O_reg[ii * 16 + 7].x), "=f"(O_reg[ii * 16 + 7].y),
+                            "=f"(O_reg[ii * 16 + 8].x), "=f"(O_reg[ii * 16 + 8].y), "=f"(O_reg[ii * 16 + 9].x), "=f"(O_reg[ii * 16 + 9].y), "=f"(O_reg[ii * 16 + 10].x), "=f"(O_reg[ii * 16 + 10].y), "=f"(O_reg[ii * 16 + 11].x), "=f"(O_reg[ii * 16 + 11].y),
+                            "=f"(O_reg[ii * 16 + 12].x), "=f"(O_reg[ii * 16 + 12].y), "=f"(O_reg[ii * 16 + 13].x), "=f"(O_reg[ii * 16 + 13].y), "=f"(O_reg[ii * 16 + 14].x), "=f"(O_reg[ii * 16 + 14].y), "=f"(O_reg[ii * 16 + 15].x), "=f"(O_reg[ii * 16 + 15].y)
+                            : "r"(O_tm[pipeline_id].addr + ii * 32));
+
+                        if (ii == 0) {
+                            wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                            wait(L_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                            row_max = M_smem[pipeline_id][warpgroup::laneid()] * SQRT_D_INV;
+                            row_sum = L_smem[pipeline_id][warpgroup::laneid()];
+                        }
+
+                        #pragma unroll
+                        for (int jj = 0; jj < globals::BLOCK_SIZE / 4 / 2; jj++) {
+                            O_reg[jj].x = __fdividef(O_reg[jj].x, row_sum);
+                        }
+
+                        // TODO: store async
+                        // TODO: add option in TK to disable TMA swizzle
+                    }
+
+                    row_sum = __logf(row_sum); // TODO: use log2f
+                    row_sum += row_max;
+                    row_sum *= NEG_SQRT_D;
+        
+                    warpgroup::arrive(M_finished[pipeline_id]);
+
+                    L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
+                    warpgroup::sync(5);
+                    if (warpgroup::laneid() == 0) { // still skeptical of TK group vector store
+                        tma::store_async(G.L, L_smem[pipeline_id],
+                                        {task_info.batch_idx, task_info.head_idx, 0, 
+                                        2 * globals::NUM_PIPELINES * task_info.Q_block_idx + 
+                                        globals::NUM_PIPELINES * cta_id + pipeline_id});
+                        tma::store_async_read_wait();
+                    }
+                    warpgroup::arrive(L_finished[pipeline_id]);
+                    warpgroup::sync(5);
                 }
-                update_phasebit<0>(phasebits, stage);
-                stage = (stage + 1) % globals::PIPELINE_STAGES;
+
+                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
+                PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
             }
         }
-    } else if (warp_id == 14 && lane_id == 0) {
+    } else if (warp_id == 12) { // Loader group
+        // warp::decrease_registers<48>();
 
-    } else if (warp_id == 15 && lane_id == 0) {
+        if (lane_id == 0) {
+            for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
+                globals::task_info task_info = get_task_info(G, task_idx);
+                if (task_info.batch_idx == -1) break;
+    
+                // Load Q
+                wait(Q_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES * 2));
+                update_phasebit<1>(phasebits, globals::PIPELINE_STAGES * 2);
+                tma::cluster::expect_bytes(Q_arrived, sizeof(globals::Q_tile) * globals::NUM_PIPELINES, 0);
+                #pragma unroll
+                for (int pipeline_id = 0; pipeline_id < 2; pipeline_id++) {
+                    tma::cluster::load_async(Q_smem[pipeline_id], G.Q,
+                                             {task_info.batch_idx, task_info.head_idx, 
+                                             config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx + 
+                                             globals::NUM_PIPELINES * cta_id + pipeline_id, 0},
+                                             Q_arrived, (uint16_t)(1 << cta_id), 0);
+                }
 
+                // Stream K & V
+                for (int i = task_info.KV_block_start; i < task_info.KV_block_end + 1; ++i) {
+                    if (i < task_info.KV_block_end) {
+                        wait(K_finished[QK_stage], get_phasebit<1>(phasebits, QK_stage));
+                        tma::cluster::expect(K_arrived[QK_stage], 0, K_smem[QK_stage]);
+                        tma::cluster::load_async(K_smem[QK_stage], G.K, 
+                                                 {task_info.batch_idx, task_info.head_idx, 2 * i + cta_id, 0},
+                                                 K_arrived[QK_stage], (uint16_t)(1 << cta_id), 0);
+                        update_phasebit<1>(phasebits, QK_stage);
+                        QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
+                    }
+
+                    if (i > task_info.KV_block_start) {
+                        wait(V_finished[PV_stage], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES + PV_stage));
+                        tma::cluster::expect(V_arrived[PV_stage], 0, V_smem[PV_stage]);
+                        tma::cluster::load_async(V_smem[PV_stage], G.V, 
+                                                 {task_info.batch_idx, task_info.head_idx, i, cta_id},
+                                                 V_arrived[PV_stage], (uint16_t)(1 << cta_id), 0);
+                        update_phasebit<1>(phasebits, globals::PIPELINE_STAGES + PV_stage);
+                        PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
+                    }
+                }
+            }
+        }
+    } else if (warp_id == 13) { // MMA launcher group
+        // warp::decrease_registers<88>();
+
+        if (lane_id == 0 && cta_id == 0) {
+            tm_fl_t S_tm = tm_allocator.allocate<tm_fl_t>(0);
+            tm_bf_t P_tm[globals::NUM_PIPELINES] = { // overlaps with S_tm
+                tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE + (globals::BLOCK_SIZE / 2) * 0),
+                tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE + (globals::BLOCK_SIZE / 2) * 1)
+            };
+            tm_fl_t O_tm[globals::NUM_PIPELINES] = {
+                tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 2),
+                tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * 3)
+            };
+    
+            for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
+                globals::task_info task_info = get_task_info(G, task_idx);
+                if (task_info.batch_idx == -1) break;
+    
+                tma::cluster::wait(Q_arrived, get_phasebit<0>(phasebits, globals::PIPELINE_STAGES * 3 + globals::NUM_PIPELINES));
+                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES * 3 + globals::NUM_PIPELINES);
+    
+                for (int i = task_info.KV_block_start; i < task_info.KV_block_end + 1; ++i) {
+                    #pragma unroll
+                    for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
+                        // Launch S = QK^T
+                        if (i < task_info.KV_block_end) {
+                            if (pipeline_id == 0)
+                                tma::cluster::wait(K_arrived[QK_stage], get_phasebit<0>(phasebits, QK_stage));
+                            tma::cluster::wait(S_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                            update_phasebit<1>(phasebits, globals::PIPELINE_STAGES); // must be updated for every iteration
+                            mm2_ABt(S_tm, Q_smem[pipeline_id], K_smem[QK_stage], S_arrived[pipeline_id]);
+                            if (pipeline_id == 1) {
+                                update_phasebit<0>(phasebits, QK_stage);
+                                QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
+                            }
+                        }
+
+                        // Launch O = PV
+                        if (i > task_info.KV_block_start) {
+                            if (pipeline_id == 0)
+                                tma::cluster::wait(V_arrived[PV_stage], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES + PV_stage));
+                            tma::cluster::wait(P_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES * 2));
+                            tma::cluster::wait(O_scaled[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES * 2));
+                            if (i == task_info.KV_block_start + 1)
+                                mm2_AB(O_tm[pipeline_id], P_tm[pipeline_id], V_smem[PV_stage], O_arrived[pipeline_id]);
+                            else
+                                mma2_AB(O_tm[pipeline_id], P_tm[pipeline_id], V_smem[PV_stage], O_arrived[pipeline_id]);
+                            if (pipeline_id == 1) {
+                                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES + PV_stage);
+                                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES * 2);
+                                update_phasebit<1>(phasebits, globals::PIPELINE_STAGES * 2);
+                                PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (warp_id == 14 || warp_id == 15) {
+        warp::decrease_registers<24>(); // unused warps
     }
 
     // For TM deallocation
