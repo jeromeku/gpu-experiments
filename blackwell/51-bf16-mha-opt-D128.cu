@@ -234,10 +234,11 @@ static void kernel(const __grid_constant__ globals G) {
 
                 // Send O scale to correction group
                 if (i > task_info.KV_block_start) {
-                    // wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
-                    // update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
-                    // M_smem[pipeline_id][warpgroup::laneid()] = O_scale;
-                    // warpgroup::arrive(M_arrived[pipeline_id]);
+                    wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
+                    update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
+                    M_smem[pipeline_id][warpgroup::laneid()] = O_scale;
+                    warpgroup::sync(pipeline_id + 1);
+                    warpgroup::arrive(M_arrived[pipeline_id]);
                 }
 
                 // Prepare S scales
@@ -292,14 +293,15 @@ static void kernel(const __grid_constant__ globals G) {
             if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue%d\n", pipeline_id);
             if (task_info.KV_block_start < task_info.KV_block_end) {
                 // Send O scale to correction group
-                // wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
-                // update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
-                // M_smem[pipeline_id][warpgroup::laneid()] = row_max;
-                // warpgroup::arrive(M_arrived[pipeline_id]);
-                // wait(L_finished[pipeline_id], get_phasebit<1>(phasebits, L_FINISHED_PB_POS));
-                // update_phasebit<1>(phasebits, L_FINISHED_PB_POS);
-                // L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
-                // warpgroup::arrive(L_arrived[pipeline_id]);
+                wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
+                update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
+                M_smem[pipeline_id][warpgroup::laneid()] = row_max;
+                wait(L_finished[pipeline_id], get_phasebit<1>(phasebits, L_FINISHED_PB_POS));
+                update_phasebit<1>(phasebits, L_FINISHED_PB_POS);
+                L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
+                warpgroup::sync(pipeline_id + 1);
+                warpgroup::arrive(M_arrived[pipeline_id]);
+                warpgroup::arrive(L_arrived[pipeline_id]);
             }
             group<8>::sync(7);
             if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue done%d\n", pipeline_id);
@@ -342,10 +344,12 @@ static void kernel(const __grid_constant__ globals G) {
 
                         // Initially, load the scale
                         if (ii == 0) {
-                            // wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
-                            // update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
-                            // O_scale_2.x = exp2f(M_smem[pipeline_id][warpgroup::laneid()]);
-                            // O_scale_2.y = O_scale_2.x;
+                            wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
+                            update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
+                            O_scale_2.x = exp2f(M_smem[pipeline_id][warpgroup::laneid()]);
+                            O_scale_2.y = O_scale_2.x;
+                            warpgroup::sync(5);
+                            warpgroup::arrive(M_finished[pipeline_id]);
                         }
 
                         // Rescale O
@@ -366,7 +370,6 @@ static void kernel(const __grid_constant__ globals G) {
                     asm volatile("{tcgen05.wait::st.sync.aligned;}");
                     warpgroup::sync(3);
                     warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0);
-                    warpgroup::arrive(M_finished[pipeline_id]);
                 }
 
                 PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
@@ -397,12 +400,14 @@ static void kernel(const __grid_constant__ globals G) {
                             : "r"(O_tm[pipeline_id] + ii * 32));
 
                         if (ii == 0) {
-                            // wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
-                            // update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
-                            // row_max = M_smem[pipeline_id][warpgroup::laneid()] * SQRT_D_INV;
-                            // wait(L_arrived[pipeline_id], get_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id));
-                            // update_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id);
-                            // row_sum = L_smem[pipeline_id][warpgroup::laneid()];
+                            wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
+                            update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
+                            row_max = M_smem[pipeline_id][warpgroup::laneid()] * SQRT_D_INV;
+                            warpgroup::sync(5);
+                            warpgroup::arrive(M_finished[pipeline_id]);
+                            wait(L_arrived[pipeline_id], get_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id));
+                            update_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id);
+                            row_sum = L_smem[pipeline_id][warpgroup::laneid()];
                         }
 
                         #pragma unroll
@@ -415,22 +420,22 @@ static void kernel(const __grid_constant__ globals G) {
                     }
                     // store async read wait on thread 0
                     warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0); // Next tile PV can proceed
-                    // warpgroup::arrive(M_finished[pipeline_id]);
+                    
 
                     row_sum = __logf(row_sum); // TODO: use log2f
                     row_sum += row_max;
                     row_sum *= NEG_SQRT_D;
 
-                    // L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
-                    // warpgroup::sync(5);
-                    // if (warpgroup::laneid() == 0) { // still skeptical of TK group vector store
-                    //     tma::store_async(G.L, L_smem[pipeline_id],
-                    //                     {task_info.batch_idx, task_info.head_idx, 0, 
-                    //                     2 * globals::NUM_PIPELINES * task_info.Q_block_idx + 
-                    //                     globals::NUM_PIPELINES * cta_id + pipeline_id});
-                    //     tma::store_async_read_wait();
-                    // }
-                    // warpgroup::arrive(L_finished[pipeline_id]);
+                    L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
+                    warpgroup::sync(5);
+                    if (warpgroup::laneid() == 0) { // still skeptical of TK group vector store
+                        tma::store_async(G.L, L_smem[pipeline_id],
+                                        {task_info.batch_idx, task_info.head_idx, 0, 
+                                        2 * globals::NUM_PIPELINES * task_info.Q_block_idx + 
+                                        globals::NUM_PIPELINES * cta_id + pipeline_id});
+                        tma::store_async_read_wait();
+                    }
+                    warpgroup::arrive(L_finished[pipeline_id]);
                     warpgroup::sync(5);
                 }
 
