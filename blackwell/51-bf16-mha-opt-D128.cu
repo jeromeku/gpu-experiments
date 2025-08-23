@@ -430,13 +430,16 @@ static void kernel(const __grid_constant__ globals G) {
                             O_smem[pipeline_id][index + 0] = __float2bfloat16(O_reg[jj].x);
                             O_smem[pipeline_id][index + 1] = __float2bfloat16(O_reg[jj].y);
                         }
-                        uint64_t tma_ptr = reinterpret_cast<uint64_t>(G.O.template get_tma<globals::O_tile, 2>());
-                        asm volatile("{cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3, %4}], [%5];}"
-                            :: "l"(tma_ptr), "n"(0), 
-                               "r"(config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx + globals::NUM_PIPELINES * cta_id + pipeline_id), 
-                               "r"(task_info.head_idx), "r"(task_info.batch_idx),
-                               "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&O_smem[pipeline_id][0])))
-                            : "memory");
+                        warpgroup::sync(5);
+                        if (warpgroup::laneid() == 0) {
+                            uint64_t tma_ptr = reinterpret_cast<uint64_t>(G.O.template get_tma<globals::O_tile, 2>());
+                            asm volatile("{cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3, %4}], [%5];}"
+                                :: "l"(tma_ptr), "r"(ii * 32), 
+                                   "r"((config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx + globals::NUM_PIPELINES * cta_id + pipeline_id) * globals::BLOCK_SIZE), 
+                                   "r"(task_info.head_idx), "r"(task_info.batch_idx),
+                                   "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&O_smem[pipeline_id][0])))
+                                 : "memory");
+                        }
                     }
                     warpgroup::tma::store_async_read_wait();
                     warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0); // Next tile PV can proceed
