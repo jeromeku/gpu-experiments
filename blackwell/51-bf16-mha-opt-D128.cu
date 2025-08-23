@@ -35,7 +35,7 @@ struct globals {
     using V_tile = st_bf<BLOCK_SIZE, VO_DIM / 2>;          // 16384 B
     using M_vec  = col_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>; // 512   B
     using L_vec  = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>;     // 512   B
-    using O_tile = st_bf<BLOCK_SIZE, VO_DIM>;              // 32768 B
+    using O_tile = st_bf<BLOCK_SIZE, VO_DIM / 4>;          // 8192  B
 
     using Q_gl = gl<bf16,  -1, -1, -1, -1, Q_tile>; // B, H, N, D
     using K_gl = gl<bf16,  -1, -1, -1, -1, K_tile>;
@@ -96,6 +96,7 @@ static void kernel(const __grid_constant__ globals G) {
         sizeof(globals::Q_tile) * globals::NUM_PIPELINES +   // 65536 B
         sizeof(globals::K_tile) * globals::PIPELINE_STAGES + // 49152 B
         sizeof(globals::V_tile) * globals::PIPELINE_STAGES + // 49152 B
+        sizeof(globals::O_tile) * globals::NUM_PIPELINES +   // 16384 B
         sizeof(globals::L_vec) * globals::NUM_PIPELINES +    // 1024  B
         sizeof(globals::M_vec) * globals::NUM_PIPELINES <=   // 1024  B
         config::DYNAMIC_SHARED_MEMORY
@@ -103,9 +104,9 @@ static void kernel(const __grid_constant__ globals G) {
     globals::Q_tile (&Q_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::Q_tile, globals::NUM_PIPELINES>();
     globals::K_tile (&K_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::K_tile, globals::PIPELINE_STAGES>();
     globals::V_tile (&V_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::V_tile, globals::PIPELINE_STAGES>();
+    globals::O_tile (&O_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::O_tile, globals::NUM_PIPELINES>();
     globals::L_vec  (&L_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::L_vec, globals::NUM_PIPELINES>();
     globals::M_vec  (&M_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::M_vec, globals::NUM_PIPELINES>();
-    globals::O_tile (&O_smem)[globals::NUM_PIPELINES]   = *reinterpret_cast<globals::O_tile(*)[globals::NUM_PIPELINES]>(&Q_smem[0]);
 
     // Allocate tensor memory
     tensor_allocator<1, config::CLUSTER_SIZE> tm_allocator {};
@@ -184,18 +185,20 @@ static void kernel(const __grid_constant__ globals G) {
             globals::task_info task_info = get_task_info(G, task_idx);
             if (task_info.batch_idx == -1) break;
 
-            if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Task ID %d-%d\n", pipeline_id, task_idx);
+            // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Task ID %d-%d\n", pipeline_id, task_idx);
             
-            float row_max = 0xFF800000; // -inf
+            float row_max = std::bit_cast<float>(0xFF800000); // -inf
             float row_sum = 0.f;
+
+            if (blockIdx.x == BLOCKIDX && threadIdx.x == 0) printf("Row max %f, row sum %f\n", row_max, row_sum);
             
             for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
-                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("KV index %d-%d\n", pipeline_id, i);
+                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("KV index %d-%d\n", pipeline_id, i);
                 
                 // if (warp_id >= 4) softmax_group::sync(1);
-                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Waiting for S = QK finished%d-%d\n", pipeline_id, i);
+                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Waiting for S = QK finished%d-%d\n", pipeline_id, i);
                 tma::cluster::wait(S_arrived[pipeline_id], get_phasebit<0>(phasebits, S_ARRIVED_PB_POS));
-                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Done waiting for S = QK finished%d-%d\n", pipeline_id, i);
+                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Done waiting for S = QK finished%d-%d\n", pipeline_id, i);
                 update_phasebit<0>(phasebits, S_ARRIVED_PB_POS);
                 warpgroup::arrive(K_finished[QK_stage]);
                 QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
@@ -253,9 +256,9 @@ static void kernel(const __grid_constant__ globals G) {
                 }
 
                 // Registers --> TMEM                
-                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Waiting for PV finished%d-%d\n", pipeline_id, i);
+                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Waiting for PV finished%d-%d\n", pipeline_id, i);
                 wait(P_finished[pipeline_id], get_phasebit<1>(phasebits, P_FINISHED_PB_POS));
-                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Done waiting for PV finished%d-%d\n", pipeline_id, i);
+                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Done waiting for PV finished%d-%d\n", pipeline_id, i);
                 update_phasebit<1>(phasebits, P_FINISHED_PB_POS);
                 #pragma unroll
                 for (int ii = 0; ii < globals::BLOCK_SIZE / 32; ii++) {
@@ -287,10 +290,12 @@ static void kernel(const __grid_constant__ globals G) {
                 row_sum += local_sum.x + local_sum.y;
             }
 
-            group<8>::sync(7);
+            if (blockIdx.x == BLOCKIDX && threadIdx.x == 0) printf("Row sum %f, row max %f\n", row_sum, row_max);
+
+            // group<8>::sync(7);
 
             // Save for epilogue
-            if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue%d\n", pipeline_id);
+            // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue%d\n", pipeline_id);
             if (task_info.KV_block_start < task_info.KV_block_end) {
                 // Send O scale to correction group
                 wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
@@ -303,8 +308,8 @@ static void kernel(const __grid_constant__ globals G) {
                 warpgroup::arrive(M_arrived[pipeline_id]);
                 warpgroup::arrive(L_arrived[pipeline_id]);
             }
-            group<8>::sync(7);
-            if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue done%d\n", pipeline_id);
+            // group<8>::sync(7);
+            // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue done%d\n", pipeline_id);
         }
     } else if (warp_id < 12) { // Scale & epilogue group
         // warpgroup::decrease_registers<48>();
@@ -376,8 +381,8 @@ static void kernel(const __grid_constant__ globals G) {
             }
 
             // Epilogue
-            group<4>::sync(11);
-            if (warpgroup::laneid() == 0 && blockIdx.x == BLOCKIDX) printf("Starting epilogue\n");
+            // group<4>::sync(11);
+            // if (warpgroup::laneid() == 0 && blockIdx.x == BLOCKIDX) printf("Starting epilogue\n");
             if (task_info.KV_block_start < task_info.KV_block_end) {
                 #pragma unroll
                 for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
@@ -417,10 +422,24 @@ static void kernel(const __grid_constant__ globals G) {
 
                         // TODO: store async
                         // TODO: add option in TK to disable TMA swizzle
+                        #pragma unroll
+                        for (int jj = 0; jj < globals::BLOCK_SIZE / 4 / 2; jj++) {
+                            int index = warpgroup::laneid() * globals::BLOCK_SIZE / 4 + // row
+                                        ii * globals::BLOCK_SIZE / 4 + jj * 2;          // column
+                            // TODO: optimize
+                            O_smem[pipeline_id][index + 0] = __float2bfloat16(O_reg[jj].x);
+                            O_smem[pipeline_id][index + 1] = __float2bfloat16(O_reg[jj].y);
+                        }
+                        uint64_t tma_ptr = reinterpret_cast<uint64_t>(G.O.template get_tma<globals::O_tile, 2>());
+                        asm volatile("{cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3, %4}], [%5];}"
+                            :: "l"(tma_ptr), "n"(0), 
+                               "r"(config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx + globals::NUM_PIPELINES * cta_id + pipeline_id), 
+                               "r"(task_info.head_idx), "r"(task_info.batch_idx),
+                               "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&O_smem[pipeline_id][0])))
+                            : "memory");
                     }
-                    // store async read wait on thread 0
+                    warpgroup::tma::store_async_read_wait();
                     warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0); // Next tile PV can proceed
-                    
 
                     row_sum = __logf(row_sum); // TODO: use log2f
                     row_sum += row_max;
@@ -431,7 +450,7 @@ static void kernel(const __grid_constant__ globals G) {
                     if (warpgroup::laneid() == 0) { // still skeptical of TK group vector store
                         tma::store_async(G.L, L_smem[pipeline_id],
                                         {task_info.batch_idx, task_info.head_idx, 0, 
-                                        2 * globals::NUM_PIPELINES * task_info.Q_block_idx + 
+                                        config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx +
                                         globals::NUM_PIPELINES * cta_id + pipeline_id});
                         tma::store_async_read_wait();
                     }
@@ -441,8 +460,8 @@ static void kernel(const __grid_constant__ globals G) {
 
                 PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
             }
-            group<4>::sync(11);
-            if (warpgroup::laneid() == 0 && blockIdx.x == BLOCKIDX) printf("Done epilogue\n");
+            // group<4>::sync(11);
+            // if (warpgroup::laneid() == 0 && blockIdx.x == BLOCKIDX) printf("Done epilogue\n");
         }
     } else if (warp_id == 12) { // Loader group
         // warp::decrease_registers<48>();
@@ -492,7 +511,7 @@ static void kernel(const __grid_constant__ globals G) {
                 }
             }
 
-            if (blockIdx.x == BLOCKIDX) printf("Loader group done\n");
+            // if (blockIdx.x == BLOCKIDX) printf("Loader group done\n");
         }
     } else if (warp_id == 13) { // MMA launcher group
         // warp::decrease_registers<88>();
@@ -568,7 +587,7 @@ static void kernel(const __grid_constant__ globals G) {
                 }
             }
 
-            if (blockIdx.x == BLOCKIDX) printf("MMA group done\n");
+            // if (blockIdx.x == BLOCKIDX) printf("MMA group done\n");
         }
     } else if (warp_id == 14 || warp_id == 15) {
         warp::decrease_registers<24>(); // unused warps
@@ -577,7 +596,7 @@ static void kernel(const __grid_constant__ globals G) {
     // For TM deallocation
     everyone::tma::cluster::sync();
 
-    if (blockIdx.x < 8 && threadIdx.x == 0) printf("Everyone Done %d!\n", blockIdx.x);
+    // if (blockIdx.x < 8 && threadIdx.x == 0) printf("Everyone Done %d!\n", blockIdx.x);
 }
 
 } // namespace bf16_mha_fwd
