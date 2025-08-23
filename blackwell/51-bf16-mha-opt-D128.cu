@@ -5,6 +5,8 @@
 using namespace kittens;
 using namespace kittens::prototype;
 
+constexpr int BLOCKIDX = 0;
+
 namespace bf16_mha_fwd {
 
 struct config {
@@ -17,9 +19,6 @@ struct config {
     static constexpr int NUM_WARPGROUPS = 4; // 8 softmax + 4 scaling & epilogue + 1 TMA + 1 MMA + 2 unused
     static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS; 
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
-
-    static constexpr int PRODUCER_REGISTERS = 64;
-    static constexpr int CONSUMER_REGISTERS = 104;
 };
 
 struct globals {
@@ -42,7 +41,7 @@ struct globals {
     using K_gl = gl<bf16,  -1, -1, -1, -1, K_tile>;
     using V_gl = gl<bf16,  -1, -1, -1, -1, V_tile>;
     using L_gl = gl<float, -1, -1, -1, -1, L_vec>;
-    using O_gl = gl<bf16,  -1, -1, -1, -1, O_tile>;
+    using O_gl = gl<bf16,  -1, -1, -1, -1, tma::descriptor<O_tile, 2, false>>; // disable swizzle
 
     Q_gl Q;
     K_gl K;
@@ -86,20 +85,6 @@ __device__ inline globals::task_info get_task_info(const globals &G, int task_id
         return task_info;
 }
 
-struct rescale_add {
-    template<typename T> static __device__ inline T op(const T &a, const T &b) {
-        if constexpr (std::is_same_v<T, float2>) {
-            constexpr float2 scale = {1.44269504089f*0.08838834764f, 1.44269504089f*0.08838834764f};
-            float2 c;
-            asm volatile("{fma.rn.f32x2 %0, %1, %2, %3;}" : "=l"(*(uint64_t*)&c) : "l"(*(uint64_t*)&a), "l"(*(uint64_t*)&scale), "l"(*(uint64_t*)&b));
-            return c;
-        }
-        else {
-            static_assert(sizeof(T) == 999, "Currently unsupported type");
-        }
-    }
-};
-
 __global__ __cluster_dims__(config::CLUSTER_SIZE) __launch_bounds__(config::NUM_THREADS, 1)
 static void kernel(const __grid_constant__ globals G) {
     // Declare shared memory
@@ -119,52 +104,51 @@ static void kernel(const __grid_constant__ globals G) {
     globals::K_tile (&K_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::K_tile, globals::PIPELINE_STAGES>();
     globals::V_tile (&V_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::V_tile, globals::PIPELINE_STAGES>();
     globals::L_vec  (&L_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::L_vec, globals::NUM_PIPELINES>();
-    globals::L_vec  (&M_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::M_vec, globals::NUM_PIPELINES>();
+    globals::M_vec  (&M_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::M_vec, globals::NUM_PIPELINES>();
     globals::O_tile (&O_smem)[globals::NUM_PIPELINES]   = *reinterpret_cast<globals::O_tile(*)[globals::NUM_PIPELINES]>(&Q_smem[0]);
 
     // Allocate tensor memory
     tensor_allocator<1, config::CLUSTER_SIZE> tm_allocator {};
-    using tm_fl_t = tt<float, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
-    using tm_bf_t = tt<bf16, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
-    using tm_chunk_bf_t = tt<bf16, globals::BLOCK_SIZE, globals::BLOCK_SIZE / 4>;
 
     // Set up mbarriers
-    __shared__ semaphore Q_arrived;
-    __shared__ semaphore Q_finished;
-    __shared__ semaphore K_arrived[globals::PIPELINE_STAGES];
-    __shared__ semaphore K_finished[globals::PIPELINE_STAGES];
-    __shared__ semaphore V_arrived[globals::PIPELINE_STAGES];
-    __shared__ semaphore V_finished[globals::PIPELINE_STAGES];
-    __shared__ semaphore S_arrived[globals::NUM_PIPELINES];
-    __shared__ semaphore S_finished;
-    __shared__ semaphore P_arrived[globals::NUM_PIPELINES];
-    __shared__ semaphore O_arrived[globals::NUM_PIPELINES];
-    __shared__ semaphore O_scaled[globals::NUM_PIPELINES];
-    __shared__ semaphore M_arrived[globals::NUM_PIPELINES];
-    __shared__ semaphore M_finished[globals::NUM_PIPELINES];
-    __shared__ semaphore L_arrived[globals::NUM_PIPELINES];
-    __shared__ semaphore L_finished[globals::NUM_PIPELINES];
+    __shared__ semaphore Q_arrived[globals::NUM_PIPELINES];    // TMA load completion for Q tiles
+    __shared__ semaphore Q_finished[globals::NUM_PIPELINES];   // Q processing completion (end of current tile)
+    __shared__ semaphore K_arrived[globals::PIPELINE_STAGES];  // TMA load completion for K tiles
+    __shared__ semaphore K_finished[globals::PIPELINE_STAGES]; // K processing completion (end of 2 QK^T matmuls)
+    __shared__ semaphore V_arrived[globals::PIPELINE_STAGES];  // TMA load completion for V tiles
+    __shared__ semaphore V_finished[globals::PIPELINE_STAGES]; // V processing completion (end of 2 PV matmuls)
+    __shared__ semaphore S_arrived[globals::NUM_PIPELINES];    // QK^T matmul completion
+    __shared__ semaphore S_finished;                           // S TMEM emptied (finished loading into registers)
+    __shared__ semaphore P_arrived[globals::NUM_PIPELINES];    // P matrix ready for PV matmul
+    __shared__ semaphore P_finished[globals::NUM_PIPELINES];   // PV matmul completion
+    __shared__ semaphore O_arrived[globals::NUM_PIPELINES];    // PV matmul completion
+    __shared__ semaphore O_ready[globals::NUM_PIPELINES];      // O ready for next PV accumulation 
+    __shared__ semaphore M_arrived[globals::NUM_PIPELINES];    // Row max SMEM ready (stored in SMEM)
+    __shared__ semaphore M_finished[globals::NUM_PIPELINES];   // Row max SMEM emptied (loaded to registers)
+    __shared__ semaphore L_arrived[globals::NUM_PIPELINES];    // Row sum SMEM ready (stored in SMEM)
+    __shared__ semaphore L_finished[globals::NUM_PIPELINES];   // Row sum SMEM emptied (loaded to registers)
     if (threadIdx.x == 0) {
-        init_semaphore(Q_arrived, 0, config::CLUSTER_SIZE);
-        init_semaphore(Q_finished, 0, globals::NUM_PIPELINES);
-        init_semaphore(S_finished, 0, 1);
+        init_semaphore(S_finished, 0, config::CLUSTER_SIZE);          // Must wait for one of the CTAs to arrive
         #pragma unroll
         for (int i = 0; i < globals::PIPELINE_STAGES; ++i) {
-            init_semaphore(K_arrived[i], 0, config::CLUSTER_SIZE);
-            init_semaphore(V_arrived[i], 0, config::CLUSTER_SIZE);
-            init_semaphore(K_finished[i], 0, globals::NUM_PIPELINES);
-            init_semaphore(V_finished[i], 0, globals::NUM_PIPELINES);
+            init_semaphore(K_arrived[i], 0, config::CLUSTER_SIZE);    // Must wait for 2 CTAs' TMA loads before 2-CTA QK^T
+            init_semaphore(K_finished[i], 0, globals::NUM_PIPELINES); // Must wait for 2 pipelines to finish QK^T
+            init_semaphore(V_arrived[i], 0, config::CLUSTER_SIZE);    // Must wait for 2 CTAs' TMA loads before 2-CTA PV
+            init_semaphore(V_finished[i], 0, globals::NUM_PIPELINES); // Must wait for 2 pipelines to finish PV
         }
         #pragma unroll
         for (int i = 0; i < globals::NUM_PIPELINES; ++i) {
-            init_semaphore(S_arrived[i], 0, 1);
-            init_semaphore(P_arrived[i], 0, config::CLUSTER_SIZE);
-            init_semaphore(O_arrived[i], 0, 1);
-            init_semaphore(O_scaled[i], 0, config::CLUSTER_SIZE);
-            init_semaphore(M_arrived[i], 0, WARPGROUP_WARPS * WARP_THREADS);
-            init_semaphore(M_finished[i], 0, 1);
-            init_semaphore(L_arrived[i], 0, 1);
-            init_semaphore(L_finished[i], 0, 1);
+            init_semaphore(Q_arrived[i], 0, config::CLUSTER_SIZE);  // Must wait for 2 CTAs' TMA loads before 2-CTA QK^T
+            init_semaphore(Q_finished[i], 0, 1);                    // Must wait for a single 2-CTA QK^T
+            init_semaphore(S_arrived[i], 0, 1);                     // Must wait for a single 2-CTA QK^T
+            init_semaphore(P_arrived[i], 0, config::CLUSTER_SIZE);  // Must wait for 2 CTAs' TMEM loads before 2-CTA PV
+            init_semaphore(P_finished[i], 0, 1);                    // Must wait for a single 2-CTA PV
+            init_semaphore(O_arrived[i], 0, 1);                     // Must wait for a single 2-CTA PV
+            init_semaphore(O_ready[i], 0, config::CLUSTER_SIZE);    // Must wait for 2 CTAs to complete O processing
+            init_semaphore(M_arrived[i], 0, 1);                     // Must wait for current pipeline only
+            init_semaphore(M_finished[i], 0, 1);                    // Must wait for current pipeline only
+            init_semaphore(L_arrived[i], 0, 1);                     // Must wait for current pipeline only
+            init_semaphore(L_finished[i], 0, 1);                    // Must wait for current pipeline only
         }
     }
     everyone::tma::cluster::sync();
@@ -185,27 +169,37 @@ static void kernel(const __grid_constant__ globals G) {
 
     if (warp_id < 8) { // 2 softmax groups
         // warpgroup::increase_registers<176>();
+        constexpr int S_ARRIVED_PB_POS = 0;
+        constexpr int P_FINISHED_PB_POS = 1;
+        constexpr int M_FINISHED_PB_POS = 2;
+        constexpr int L_FINISHED_PB_POS = 3;
 
         const int pipeline_id = warpgroup::groupid();
 
-        tm_fl_t S_tm = tm_allocator.allocate<tm_fl_t>(0);
-        tm_chunk_bf_t P_tm = tm_allocator.allocate<tm_chunk_bf_t>(globals::BLOCK_SIZE + (globals::BLOCK_SIZE / 2) * pipeline_id);
+        uint32_t S_tm = tm_allocator.addr + 0;
+        uint32_t P_tm = tm_allocator.addr + globals::BLOCK_SIZE + (globals::BLOCK_SIZE / 2) * pipeline_id;
 
         for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
             globals::task_info task_info = get_task_info(G, task_idx);
             if (task_info.batch_idx == -1) break;
 
+            if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Task ID %d-%d\n", pipeline_id, task_idx);
+            
             float row_max = 0xFF800000; // -inf
             float row_sum = 0.f;
-
+            
             for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
-                tma::cluster::wait(S_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
-                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
+                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("KV index %d-%d\n", pipeline_id, i);
+                
+                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Waiting for S = QK finished%d-%d\n", pipeline_id, i);
+                tma::cluster::wait(S_arrived[pipeline_id], get_phasebit<0>(phasebits, S_ARRIVED_PB_POS));
+                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Done waiting for S = QK finished%d-%d\n", pipeline_id, i);
+                update_phasebit<0>(phasebits, S_ARRIVED_PB_POS);
                 warpgroup::arrive(K_finished[QK_stage]);
                 QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
 
                 if (i == task_info.KV_block_end - 1)
-                    warpgroup::arrive(Q_finished);
+                    warpgroup::arrive(Q_finished[pipeline_id]);
 
                 // TMEM --> registers
                 float2 SP_reg[globals::BLOCK_SIZE / 2];
@@ -216,11 +210,11 @@ static void kernel(const __grid_constant__ globals G) {
                           "=f"(SP_reg[ii * 16 + 4].x), "=f"(SP_reg[ii * 16 + 4].y), "=f"(SP_reg[ii * 16 + 5].x), "=f"(SP_reg[ii * 16 + 5].y), "=f"(SP_reg[ii * 16 + 6].x), "=f"(SP_reg[ii * 16 + 6].y), "=f"(SP_reg[ii * 16 + 7].x), "=f"(SP_reg[ii * 16 + 7].y),
                           "=f"(SP_reg[ii * 16 + 8].x), "=f"(SP_reg[ii * 16 + 8].y), "=f"(SP_reg[ii * 16 + 9].x), "=f"(SP_reg[ii * 16 + 9].y), "=f"(SP_reg[ii * 16 + 10].x), "=f"(SP_reg[ii * 16 + 10].y), "=f"(SP_reg[ii * 16 + 11].x), "=f"(SP_reg[ii * 16 + 11].y),
                           "=f"(SP_reg[ii * 16 + 12].x), "=f"(SP_reg[ii * 16 + 12].y), "=f"(SP_reg[ii * 16 + 13].x), "=f"(SP_reg[ii * 16 + 13].y), "=f"(SP_reg[ii * 16 + 14].x), "=f"(SP_reg[ii * 16 + 14].y), "=f"(SP_reg[ii * 16 + 15].x), "=f"(SP_reg[ii * 16 + 15].y)
-                        : "r"(S_tm.addr + ii * 32));
+                        : "r"(S_tm + ii * 32));
                 }
                 float last_row_max_scaled = row_max * (LOG2E * SQRT_D_INV);
                 asm volatile("{tcgen05.wait::ld.sync.aligned;}");
-                warpgroup::arrive(S_finished);
+                warpgroup::tma::cluster::arrive(S_finished, 0);
 
                 // Row-wise max
                 #pragma unroll
@@ -236,10 +230,10 @@ static void kernel(const __grid_constant__ globals G) {
 
                 // Send O scale to correction group
                 if (i > task_info.KV_block_start) {
-                    wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
-                    update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
+                    wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
+                    update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
                     M_smem[pipeline_id][warpgroup::laneid()] = O_scale;
-                    arrive(M_arrived[pipeline_id]);
+                    warpgroup::arrive(M_arrived[pipeline_id]);
                 }
 
                 // Prepare S scales
@@ -253,7 +247,11 @@ static void kernel(const __grid_constant__ globals G) {
                     SP_reg[ii].y = exp2f(SP_reg[ii].y);
                 }
 
-                // Scaling + exp2 + registers --> TMEM
+                // Registers --> TMEM                
+                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Waiting for PV finished%d-%d\n", pipeline_id, i);
+                wait(P_finished[pipeline_id], get_phasebit<1>(phasebits, P_FINISHED_PB_POS));
+                if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Done waiting for PV finished%d-%d\n", pipeline_id, i);
+                update_phasebit<1>(phasebits, P_FINISHED_PB_POS);
                 #pragma unroll
                 for (int ii = 0; ii < globals::BLOCK_SIZE / 32; ii++) {
                     bf16_2 SP_bf_reg[16];
@@ -265,8 +263,8 @@ static void kernel(const __grid_constant__ globals G) {
                         :: "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[0])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[1])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[2])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[3])),
                            "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[4])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[5])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[6])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[7])),
                            "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[8])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[9])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[10])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[11])),
-                           "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[12])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[13])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[14])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[15]))
-                           "r"(P_tm.addr + ii * 16));
+                           "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[12])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[13])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[14])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[15])),
+                           "r"(P_tm + ii * 16));
                 }
 
                 // Signal PV launcher
@@ -284,87 +282,102 @@ static void kernel(const __grid_constant__ globals G) {
                 row_sum += local_sum.x + local_sum.y;
             }
 
+            group<8>::sync(7);
+
             // Save for epilogue
+            if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue%d\n", pipeline_id);
             if (task_info.KV_block_start < task_info.KV_block_end) {
                 // Send O scale to correction group
-                wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
-                update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
-                // wait(L_finished[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES + 1);
-                // update_phasebit<1>(phasebits, globals::PIPELINE_STAGES + 1);
+                wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
+                update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
                 M_smem[pipeline_id][warpgroup::laneid()] = row_max;
+                warpgroup::arrive(M_arrived[pipeline_id]);
+                wait(L_finished[pipeline_id], get_phasebit<1>(phasebits, L_FINISHED_PB_POS));
+                update_phasebit<1>(phasebits, L_FINISHED_PB_POS);
                 L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
-                arrive(M_arrived[pipeline_id]);
-                // arrive(L_arrived[pipeline_id]);
+                warpgroup::arrive(L_arrived[pipeline_id]);
             }
+            group<8>::sync(7);
+            if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue done%d\n", pipeline_id);
         }
     } else if (warp_id < 12) { // Scale & epilogue group
         // warpgroup::decrease_registers<48>();
+        constexpr int O_ARRIVED_PB_POS = 0;
+        constexpr int M_ARRIVED_PB_POS = O_ARRIVED_PB_POS + globals::NUM_PIPELINES;
+        constexpr int L_ARRIVED_PB_POS = M_ARRIVED_PB_POS + globals::NUM_PIPELINES;;
 
-        tm_fl_t O_tm[globals::NUM_PIPELINES] = {
-            tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * (globals::NUM_PIPELINES + 0)),
-            tm_allocator.allocate<tm_fl_t>(globals::BLOCK_SIZE * (globals::NUM_PIPELINES + 1))
+        uint32_t O_tm[globals::NUM_PIPELINES] = {
+            tm_allocator.addr + globals::BLOCK_SIZE * 2,
+            tm_allocator.addr + globals::BLOCK_SIZE * 3
         };
 
         for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
             globals::task_info task_info = get_task_info(G, task_idx);
             if (task_info.batch_idx == -1) break;
 
-            for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
+            for (int i = task_info.KV_block_start + 1; i < task_info.KV_block_end; ++i) { // skip the first iteration
                 #pragma unroll
                 for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
-                    warpgroup::tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                    warpgroup::tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<0>(phasebits, O_ARRIVED_PB_POS + pipeline_id));
+                    update_phasebit<0>(phasebits, O_ARRIVED_PB_POS + pipeline_id);
                     warpgroup::arrive(V_finished[PV_stage]);
-
-                    if (i == task_info.KV_block_start)
-                        continue; // no need to scale the first O
+                    warpgroup::arrive(P_finished[pipeline_id]); // TODO: maybe it's better for softmax group to wait directly on O_arrived
 
                     float2 O_scale_2;
 
                     #pragma unroll
                     for (int ii = 0; ii < 4; ++ii) {
+                        // TMEM --> registers
                         float2 O_reg[globals::BLOCK_SIZE / 4 / 2];
                         asm volatile("{tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];}"
                             : "=f"(O_reg[ii * 16 + 0].x), "=f"(O_reg[ii * 16 + 0].y), "=f"(O_reg[ii * 16 + 1].x), "=f"(O_reg[ii * 16 + 1].y), "=f"(O_reg[ii * 16 + 2].x), "=f"(O_reg[ii * 16 + 2].y), "=f"(O_reg[ii * 16 + 3].x), "=f"(O_reg[ii * 16 + 3].y), 
                               "=f"(O_reg[ii * 16 + 4].x), "=f"(O_reg[ii * 16 + 4].y), "=f"(O_reg[ii * 16 + 5].x), "=f"(O_reg[ii * 16 + 5].y), "=f"(O_reg[ii * 16 + 6].x), "=f"(O_reg[ii * 16 + 6].y), "=f"(O_reg[ii * 16 + 7].x), "=f"(O_reg[ii * 16 + 7].y),
                               "=f"(O_reg[ii * 16 + 8].x), "=f"(O_reg[ii * 16 + 8].y), "=f"(O_reg[ii * 16 + 9].x), "=f"(O_reg[ii * 16 + 9].y), "=f"(O_reg[ii * 16 + 10].x), "=f"(O_reg[ii * 16 + 10].y), "=f"(O_reg[ii * 16 + 11].x), "=f"(O_reg[ii * 16 + 11].y),
                               "=f"(O_reg[ii * 16 + 12].x), "=f"(O_reg[ii * 16 + 12].y), "=f"(O_reg[ii * 16 + 13].x), "=f"(O_reg[ii * 16 + 13].y), "=f"(O_reg[ii * 16 + 14].x), "=f"(O_reg[ii * 16 + 14].y), "=f"(O_reg[ii * 16 + 15].x), "=f"(O_reg[ii * 16 + 15].y)
-                            : "r"(O_tm[pipeline_id].addr + ii * 32));
+                            : "r"(O_tm[pipeline_id] + ii * 32));
 
+                        // Initially, load the scale
                         if (ii == 0) {
-                            wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                            wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
+                            update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
                             O_scale_2.x = exp2f(M_smem[pipeline_id][warpgroup::laneid()]);
                             O_scale_2.y = O_scale_2.x;
                         }
 
+                        // Rescale O
                         #pragma unroll
                         for (int jj = 0; jj < globals::BLOCK_SIZE / 4 / 2; jj++) {
                             O_reg[jj] = __fmul2_rn(O_reg[jj], O_scale_2);
                         }
 
+                        // Registers --> TMEM
                         asm volatile("{tcgen05.st.sync.aligned.32x32b.x32.b32 [%32], {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31};}"
                             :: "f"(O_reg[ii * 16 + 0].x), "f"(O_reg[ii * 16 + 0].y), "f"(O_reg[ii * 16 + 1].x), "f"(O_reg[ii * 16 + 1].y), "f"(O_reg[ii * 16 + 2].x), "f"(O_reg[ii * 16 + 2].y), "f"(O_reg[ii * 16 + 3].x), "f"(O_reg[ii * 16 + 3].y), 
                                "f"(O_reg[ii * 16 + 4].x), "f"(O_reg[ii * 16 + 4].y), "f"(O_reg[ii * 16 + 5].x), "f"(O_reg[ii * 16 + 5].y), "f"(O_reg[ii * 16 + 6].x), "f"(O_reg[ii * 16 + 6].y), "f"(O_reg[ii * 16 + 7].x), "f"(O_reg[ii * 16 + 7].y),
                                "f"(O_reg[ii * 16 + 8].x), "f"(O_reg[ii * 16 + 8].y), "f"(O_reg[ii * 16 + 9].x), "f"(O_reg[ii * 16 + 9].y), "f"(O_reg[ii * 16 + 10].x), "f"(O_reg[ii * 16 + 10].y), "f"(O_reg[ii * 16 + 11].x), "f"(O_reg[ii * 16 + 11].y),
                                "f"(O_reg[ii * 16 + 12].x), "f"(O_reg[ii * 16 + 12].y), "f"(O_reg[ii * 16 + 13].x), "f"(O_reg[ii * 16 + 13].y), "f"(O_reg[ii * 16 + 14].x), "f"(O_reg[ii * 16 + 14].y), "f"(O_reg[ii * 16 + 15].x), "f"(O_reg[ii * 16 + 15].y)
-                               "r"(O_tm[pipeline_id].addr + ii * 32));
+                               "r"(O_tm[pipeline_id] + ii * 32));
                     }
 
                     asm volatile("{tcgen05.wait::st.sync.aligned;}");
                     warpgroup::sync(3);
-                    warpgroup::tma::cluster::arrive(O_scaled[pipeline_id], 0);
+                    warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0);
                     warpgroup::arrive(M_finished[pipeline_id]);
                 }
 
-                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
                 PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
             }
 
             // Epilogue
+            group<4>::sync(11);
+            if (warpgroup::laneid() == 0 && blockIdx.x == BLOCKIDX) printf("Starting epilogue\n");
             if (task_info.KV_block_start < task_info.KV_block_end) {
                 #pragma unroll
                 for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
-                    warpgroup::tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                    warpgroup::tma::cluster::wait(O_arrived[pipeline_id], get_phasebit<0>(phasebits, O_ARRIVED_PB_POS + pipeline_id));
+                    update_phasebit<0>(phasebits, O_ARRIVED_PB_POS + pipeline_id);
                     warpgroup::arrive(V_finished[PV_stage]);
+                    warpgroup::arrive(P_finished[pipeline_id]);
 
                     float row_max;
                     float row_sum;
@@ -377,12 +390,14 @@ static void kernel(const __grid_constant__ globals G) {
                             "=f"(O_reg[ii * 16 + 4].x), "=f"(O_reg[ii * 16 + 4].y), "=f"(O_reg[ii * 16 + 5].x), "=f"(O_reg[ii * 16 + 5].y), "=f"(O_reg[ii * 16 + 6].x), "=f"(O_reg[ii * 16 + 6].y), "=f"(O_reg[ii * 16 + 7].x), "=f"(O_reg[ii * 16 + 7].y),
                             "=f"(O_reg[ii * 16 + 8].x), "=f"(O_reg[ii * 16 + 8].y), "=f"(O_reg[ii * 16 + 9].x), "=f"(O_reg[ii * 16 + 9].y), "=f"(O_reg[ii * 16 + 10].x), "=f"(O_reg[ii * 16 + 10].y), "=f"(O_reg[ii * 16 + 11].x), "=f"(O_reg[ii * 16 + 11].y),
                             "=f"(O_reg[ii * 16 + 12].x), "=f"(O_reg[ii * 16 + 12].y), "=f"(O_reg[ii * 16 + 13].x), "=f"(O_reg[ii * 16 + 13].y), "=f"(O_reg[ii * 16 + 14].x), "=f"(O_reg[ii * 16 + 14].y), "=f"(O_reg[ii * 16 + 15].x), "=f"(O_reg[ii * 16 + 15].y)
-                            : "r"(O_tm[pipeline_id].addr + ii * 32));
+                            : "r"(O_tm[pipeline_id] + ii * 32));
 
                         if (ii == 0) {
-                            wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
-                            wait(L_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES));
+                            wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
+                            update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
                             row_max = M_smem[pipeline_id][warpgroup::laneid()] * SQRT_D_INV;
+                            wait(L_arrived[pipeline_id], get_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id));
+                            update_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id);
                             row_sum = L_smem[pipeline_id][warpgroup::laneid()];
                         }
 
@@ -394,12 +409,13 @@ static void kernel(const __grid_constant__ globals G) {
                         // TODO: store async
                         // TODO: add option in TK to disable TMA swizzle
                     }
+                    // store async read wait on thread 0
+                    warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0); // Next tile PV can proceed
+                    warpgroup::arrive(M_finished[pipeline_id]);
 
                     row_sum = __logf(row_sum); // TODO: use log2f
                     row_sum += row_max;
                     row_sum *= NEG_SQRT_D;
-        
-                    warpgroup::arrive(M_finished[pipeline_id]);
 
                     L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
                     warpgroup::sync(5);
@@ -414,61 +430,75 @@ static void kernel(const __grid_constant__ globals G) {
                     warpgroup::sync(5);
                 }
 
-                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES);
                 PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
             }
+            group<4>::sync(11);
+            if (warpgroup::laneid() == 0 && blockIdx.x == BLOCKIDX) printf("Done epilogue\n");
         }
     } else if (warp_id == 12) { // Loader group
         // warp::decrease_registers<48>();
+        constexpr int Q_FINISHED_PB_POS = 0;
+        constexpr int K_FINISHED_PB_POS = Q_FINISHED_PB_POS + globals::NUM_PIPELINES;
+        constexpr int V_FINISHED_PB_POS = K_FINISHED_PB_POS + globals::PIPELINE_STAGES;
 
         if (lane_id == 0) {
             for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
                 globals::task_info task_info = get_task_info(G, task_idx);
                 if (task_info.batch_idx == -1) break;
-    
+
                 // Load Q
-                wait(Q_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES * 2));
-                update_phasebit<1>(phasebits, globals::PIPELINE_STAGES * 2);
-                tma::cluster::expect_bytes(Q_arrived, sizeof(globals::Q_tile) * globals::NUM_PIPELINES, 0);
                 #pragma unroll
                 for (int pipeline_id = 0; pipeline_id < 2; pipeline_id++) {
+                    wait(Q_finished[pipeline_id], get_phasebit<1>(phasebits, Q_FINISHED_PB_POS + pipeline_id));
+                    update_phasebit<1>(phasebits, Q_FINISHED_PB_POS + pipeline_id);
+                    tma::cluster::expect_bytes(Q_arrived[pipeline_id], sizeof(globals::Q_tile), 0);
                     tma::cluster::load_async(Q_smem[pipeline_id], G.Q,
                                              {task_info.batch_idx, task_info.head_idx, 
                                              config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx + 
                                              globals::NUM_PIPELINES * cta_id + pipeline_id, 0},
-                                             Q_arrived, (uint16_t)(1 << cta_id), 0);
+                                             Q_arrived[pipeline_id], (uint16_t)(1 << cta_id), 0);
                 }
 
                 // Stream K & V
-                for (int i = task_info.KV_block_start; i < task_info.KV_block_end + 1; ++i) {
+                for (int i = task_info.KV_block_start; i < task_info.KV_block_end + 1; ++i) { // add 1 more iteration to load 2 Ks first
                     if (i < task_info.KV_block_end) {
-                        wait(K_finished[QK_stage], get_phasebit<1>(phasebits, QK_stage));
+                        wait(K_finished[QK_stage], get_phasebit<1>(phasebits, K_FINISHED_PB_POS + QK_stage));
+                        update_phasebit<1>(phasebits, K_FINISHED_PB_POS + QK_stage);
                         tma::cluster::expect(K_arrived[QK_stage], 0, K_smem[QK_stage]);
                         tma::cluster::load_async(K_smem[QK_stage], G.K, 
                                                  {task_info.batch_idx, task_info.head_idx, 2 * i + cta_id, 0},
                                                  K_arrived[QK_stage], (uint16_t)(1 << cta_id), 0);
-                        update_phasebit<1>(phasebits, QK_stage);
                         QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
                     }
 
                     if (i > task_info.KV_block_start) {
-                        wait(V_finished[PV_stage], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES + PV_stage));
+                        wait(V_finished[PV_stage], get_phasebit<1>(phasebits, V_FINISHED_PB_POS + PV_stage));
+                        update_phasebit<1>(phasebits, V_FINISHED_PB_POS + PV_stage);
                         tma::cluster::expect(V_arrived[PV_stage], 0, V_smem[PV_stage]);
                         tma::cluster::load_async(V_smem[PV_stage], G.V, 
                                                  {task_info.batch_idx, task_info.head_idx, i, cta_id},
                                                  V_arrived[PV_stage], (uint16_t)(1 << cta_id), 0);
-                        update_phasebit<1>(phasebits, globals::PIPELINE_STAGES + PV_stage);
                         PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
                     }
                 }
             }
+
+            if (blockIdx.x == BLOCKIDX) printf("Loader group done\n");
         }
     } else if (warp_id == 13) { // MMA launcher group
         // warp::decrease_registers<88>();
+        constexpr int Q_ARRIVED_PB_POS = 0;
+        constexpr int K_ARRIVED_PB_POS = Q_ARRIVED_PB_POS + globals::NUM_PIPELINES;
+        constexpr int V_ARRIVED_PB_POS = K_ARRIVED_PB_POS + globals::PIPELINE_STAGES;
+        constexpr int S_FINISHED_PB_POS = V_ARRIVED_PB_POS + globals::PIPELINE_STAGES;
+        constexpr int P_ARRIVED_PB_POS = S_FINISHED_PB_POS + 1;
+        constexpr int O_READY_PB_POS = P_ARRIVED_PB_POS + globals::NUM_PIPELINES;
 
         if (lane_id == 0 && cta_id == 0) {
+            using tm_fl_t = tt<float, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
+            using tm_bf_t = tt<bf16, globals::BLOCK_SIZE, globals::BLOCK_SIZE>;
             tm_fl_t S_tm = tm_allocator.allocate<tm_fl_t>(0);
-            tm_bf_t P_tm[globals::NUM_PIPELINES] = { // overlaps with S_tm
+            tm_bf_t P_tm[globals::NUM_PIPELINES] = {
                 tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE + (globals::BLOCK_SIZE / 2) * 0),
                 tm_allocator.allocate<tm_bf_t>(globals::BLOCK_SIZE + (globals::BLOCK_SIZE / 2) * 1)
             };
@@ -480,46 +510,56 @@ static void kernel(const __grid_constant__ globals G) {
             for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
                 globals::task_info task_info = get_task_info(G, task_idx);
                 if (task_info.batch_idx == -1) break;
-    
-                tma::cluster::wait(Q_arrived, get_phasebit<0>(phasebits, globals::PIPELINE_STAGES * 3 + globals::NUM_PIPELINES));
-                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES * 3 + globals::NUM_PIPELINES);
-    
+
+                // Wait for Q arrival
+                if (task_info.KV_block_start < task_info.KV_block_end) {
+                    #pragma unroll
+                    for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
+                        tma::cluster::wait(Q_arrived[pipeline_id], get_phasebit<0>(phasebits, Q_ARRIVED_PB_POS + pipeline_id));
+                        update_phasebit<0>(phasebits, Q_ARRIVED_PB_POS + pipeline_id);
+                    }
+                }
+
                 for (int i = task_info.KV_block_start; i < task_info.KV_block_end + 1; ++i) {
                     #pragma unroll
                     for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
                         // Launch S = QK^T
                         if (i < task_info.KV_block_end) {
-                            if (pipeline_id == 0)
-                                tma::cluster::wait(K_arrived[QK_stage], get_phasebit<0>(phasebits, QK_stage));
-                            tma::cluster::wait(S_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
-                            update_phasebit<1>(phasebits, globals::PIPELINE_STAGES); // must be updated for every iteration
+                            if (pipeline_id == 0) {
+                                tma::cluster::wait(K_arrived[QK_stage], get_phasebit<0>(phasebits, K_ARRIVED_PB_POS + QK_stage));
+                                update_phasebit<0>(phasebits, K_ARRIVED_PB_POS + QK_stage);
+                            }
+                            tma::cluster::wait(S_finished, get_phasebit<1>(phasebits, S_FINISHED_PB_POS));
+                            update_phasebit<1>(phasebits, S_FINISHED_PB_POS); // must be updated for every iteration
                             mm2_ABt(S_tm, Q_smem[pipeline_id], K_smem[QK_stage], S_arrived[pipeline_id]);
-                            if (pipeline_id == 1) {
-                                update_phasebit<0>(phasebits, QK_stage);
+                            if (pipeline_id == globals::NUM_PIPELINES - 1) {
                                 QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
                             }
                         }
 
                         // Launch O = PV
                         if (i > task_info.KV_block_start) {
-                            if (pipeline_id == 0)
-                                tma::cluster::wait(V_arrived[PV_stage], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES + PV_stage));
-                            tma::cluster::wait(P_arrived[pipeline_id], get_phasebit<0>(phasebits, globals::PIPELINE_STAGES * 2));
-                            tma::cluster::wait(O_scaled[pipeline_id], get_phasebit<1>(phasebits, globals::PIPELINE_STAGES * 2));
+                            if (pipeline_id == 0) {
+                                tma::cluster::wait(V_arrived[PV_stage], get_phasebit<0>(phasebits, V_ARRIVED_PB_POS + PV_stage));
+                                update_phasebit<0>(phasebits, V_ARRIVED_PB_POS + PV_stage);
+                            }
+                            tma::cluster::wait(P_arrived[pipeline_id], get_phasebit<0>(phasebits, P_ARRIVED_PB_POS + pipeline_id));
+                            update_phasebit<0>(phasebits, P_ARRIVED_PB_POS + pipeline_id);
+                            tma::cluster::wait(O_ready[pipeline_id], get_phasebit<1>(phasebits, O_READY_PB_POS + pipeline_id));
+                            update_phasebit<1>(phasebits, O_READY_PB_POS + pipeline_id);
                             if (i == task_info.KV_block_start + 1)
                                 mm2_AB(O_tm[pipeline_id], P_tm[pipeline_id], V_smem[PV_stage], O_arrived[pipeline_id]);
                             else
                                 mma2_AB(O_tm[pipeline_id], P_tm[pipeline_id], V_smem[PV_stage], O_arrived[pipeline_id]);
-                            if (pipeline_id == 1) {
-                                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES + PV_stage);
-                                update_phasebit<0>(phasebits, globals::PIPELINE_STAGES * 2);
-                                update_phasebit<1>(phasebits, globals::PIPELINE_STAGES * 2);
+                            if (pipeline_id == globals::NUM_PIPELINES - 1) {
                                 PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
                             }
                         }
                     }
                 }
             }
+
+            if (blockIdx.x == BLOCKIDX) printf("MMA group done\n");
         }
     } else if (warp_id == 14 || warp_id == 15) {
         warp::decrease_registers<24>(); // unused warps
@@ -527,6 +567,8 @@ static void kernel(const __grid_constant__ globals G) {
 
     // For TM deallocation
     everyone::tma::cluster::sync();
+
+    if (blockIdx.x < 8 && threadIdx.x == 0) printf("Everyone Done %d!\n", blockIdx.x);
 }
 
 } // namespace bf16_mha_fwd
