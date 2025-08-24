@@ -190,8 +190,6 @@ static void kernel(const __grid_constant__ globals G) {
             float row_max = std::bit_cast<float>(0xFF800000); // -inf
             float row_sum = 0.f;
 
-            if (blockIdx.x == BLOCKIDX && threadIdx.x == 0) printf("Row max %f, row sum %f\n", row_max, row_sum);
-            
             for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
                 // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("KV index %d-%d\n", pipeline_id, i);
                 
@@ -266,6 +264,7 @@ static void kernel(const __grid_constant__ globals G) {
                     #pragma unroll
                     for (int jj = 0; jj < 16; jj++) {
                         SP_bf_reg[jj] = __float22bfloat162_rn(SP_reg[ii * 16 + jj]);
+                        // if (blockIdx.x == BLOCKIDX && threadIdx.x == 0) printf("%f %f ", SP_reg[ii * 16 + jj].x, SP_reg[ii * 16 + jj].y);
                     }
                     asm volatile("{tcgen05.st.sync.aligned.32x32b.x16.b32 [%16], {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15};}"
                         :: "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[0])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[1])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[2])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[3])),
@@ -274,6 +273,8 @@ static void kernel(const __grid_constant__ globals G) {
                            "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[12])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[13])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[14])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[15])),
                            "r"(P_tm + ii * 16));
                 }
+
+                // if (blockIdx.x == BLOCKIDX && threadIdx.x == 0) printf("\n");
 
                 // Signal PV launcher
                 asm volatile("{tcgen05.wait::st.sync.aligned;}");
@@ -290,7 +291,7 @@ static void kernel(const __grid_constant__ globals G) {
                 row_sum += local_sum.x + local_sum.y;
             }
 
-            if (blockIdx.x == BLOCKIDX && threadIdx.x == 0) printf("Row sum %f, row max %f\n", row_sum, row_max);
+            if (blockIdx.x == BLOCKIDX && threadIdx.x == 0) printf("\nRow sum %f, row max %f\n", row_sum, row_max);
 
             // group<8>::sync(7);
 
@@ -341,10 +342,10 @@ static void kernel(const __grid_constant__ globals G) {
                         // TMEM --> registers
                         float2 O_reg[globals::BLOCK_SIZE / 4 / 2];
                         asm volatile("{tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];}"
-                            : "=f"(O_reg[ii * 16 + 0].x), "=f"(O_reg[ii * 16 + 0].y), "=f"(O_reg[ii * 16 + 1].x), "=f"(O_reg[ii * 16 + 1].y), "=f"(O_reg[ii * 16 + 2].x), "=f"(O_reg[ii * 16 + 2].y), "=f"(O_reg[ii * 16 + 3].x), "=f"(O_reg[ii * 16 + 3].y), 
-                              "=f"(O_reg[ii * 16 + 4].x), "=f"(O_reg[ii * 16 + 4].y), "=f"(O_reg[ii * 16 + 5].x), "=f"(O_reg[ii * 16 + 5].y), "=f"(O_reg[ii * 16 + 6].x), "=f"(O_reg[ii * 16 + 6].y), "=f"(O_reg[ii * 16 + 7].x), "=f"(O_reg[ii * 16 + 7].y),
-                              "=f"(O_reg[ii * 16 + 8].x), "=f"(O_reg[ii * 16 + 8].y), "=f"(O_reg[ii * 16 + 9].x), "=f"(O_reg[ii * 16 + 9].y), "=f"(O_reg[ii * 16 + 10].x), "=f"(O_reg[ii * 16 + 10].y), "=f"(O_reg[ii * 16 + 11].x), "=f"(O_reg[ii * 16 + 11].y),
-                              "=f"(O_reg[ii * 16 + 12].x), "=f"(O_reg[ii * 16 + 12].y), "=f"(O_reg[ii * 16 + 13].x), "=f"(O_reg[ii * 16 + 13].y), "=f"(O_reg[ii * 16 + 14].x), "=f"(O_reg[ii * 16 + 14].y), "=f"(O_reg[ii * 16 + 15].x), "=f"(O_reg[ii * 16 + 15].y)
+                            : "=f"(O_reg[0].x), "=f"(O_reg[0].y), "=f"(O_reg[1].x), "=f"(O_reg[1].y), "=f"(O_reg[2].x), "=f"(O_reg[2].y), "=f"(O_reg[3].x), "=f"(O_reg[3].y), 
+                              "=f"(O_reg[4].x), "=f"(O_reg[4].y), "=f"(O_reg[5].x), "=f"(O_reg[5].y), "=f"(O_reg[6].x), "=f"(O_reg[6].y), "=f"(O_reg[7].x), "=f"(O_reg[7].y),
+                              "=f"(O_reg[8].x), "=f"(O_reg[8].y), "=f"(O_reg[9].x), "=f"(O_reg[9].y), "=f"(O_reg[10].x), "=f"(O_reg[10].y), "=f"(O_reg[11].x), "=f"(O_reg[11].y),
+                              "=f"(O_reg[12].x), "=f"(O_reg[12].y), "=f"(O_reg[13].x), "=f"(O_reg[13].y), "=f"(O_reg[14].x), "=f"(O_reg[14].y), "=f"(O_reg[15].x), "=f"(O_reg[15].y)
                             : "r"(O_tm[pipeline_id] + ii * 32));
 
                         // Initially, load the scale
@@ -365,10 +366,10 @@ static void kernel(const __grid_constant__ globals G) {
 
                         // Registers --> TMEM
                         asm volatile("{tcgen05.st.sync.aligned.32x32b.x32.b32 [%32], {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31};}"
-                            :: "f"(O_reg[ii * 16 + 0].x), "f"(O_reg[ii * 16 + 0].y), "f"(O_reg[ii * 16 + 1].x), "f"(O_reg[ii * 16 + 1].y), "f"(O_reg[ii * 16 + 2].x), "f"(O_reg[ii * 16 + 2].y), "f"(O_reg[ii * 16 + 3].x), "f"(O_reg[ii * 16 + 3].y), 
-                               "f"(O_reg[ii * 16 + 4].x), "f"(O_reg[ii * 16 + 4].y), "f"(O_reg[ii * 16 + 5].x), "f"(O_reg[ii * 16 + 5].y), "f"(O_reg[ii * 16 + 6].x), "f"(O_reg[ii * 16 + 6].y), "f"(O_reg[ii * 16 + 7].x), "f"(O_reg[ii * 16 + 7].y),
-                               "f"(O_reg[ii * 16 + 8].x), "f"(O_reg[ii * 16 + 8].y), "f"(O_reg[ii * 16 + 9].x), "f"(O_reg[ii * 16 + 9].y), "f"(O_reg[ii * 16 + 10].x), "f"(O_reg[ii * 16 + 10].y), "f"(O_reg[ii * 16 + 11].x), "f"(O_reg[ii * 16 + 11].y),
-                               "f"(O_reg[ii * 16 + 12].x), "f"(O_reg[ii * 16 + 12].y), "f"(O_reg[ii * 16 + 13].x), "f"(O_reg[ii * 16 + 13].y), "f"(O_reg[ii * 16 + 14].x), "f"(O_reg[ii * 16 + 14].y), "f"(O_reg[ii * 16 + 15].x), "f"(O_reg[ii * 16 + 15].y)
+                            :: "f"(O_reg[0].x), "f"(O_reg[0].y), "f"(O_reg[1].x), "f"(O_reg[1].y), "f"(O_reg[2].x), "f"(O_reg[2].y), "f"(O_reg[3].x), "f"(O_reg[3].y), 
+                               "f"(O_reg[4].x), "f"(O_reg[4].y), "f"(O_reg[5].x), "f"(O_reg[5].y), "f"(O_reg[6].x), "f"(O_reg[6].y), "f"(O_reg[7].x), "f"(O_reg[7].y),
+                               "f"(O_reg[8].x), "f"(O_reg[8].y), "f"(O_reg[9].x), "f"(O_reg[9].y), "f"(O_reg[10].x), "f"(O_reg[10].y), "f"(O_reg[11].x), "f"(O_reg[11].y),
+                               "f"(O_reg[12].x), "f"(O_reg[12].y), "f"(O_reg[13].x), "f"(O_reg[13].y), "f"(O_reg[14].x), "f"(O_reg[14].y), "f"(O_reg[15].x), "f"(O_reg[15].y),
                                "r"(O_tm[pipeline_id] + ii * 32));
                     }
 
@@ -398,10 +399,10 @@ static void kernel(const __grid_constant__ globals G) {
                     for (int ii = 0; ii < 4; ++ii) {
                         float2 O_reg[globals::BLOCK_SIZE / 4 / 2];
                         asm volatile("{tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];}"
-                            : "=f"(O_reg[ii * 16 + 0].x), "=f"(O_reg[ii * 16 + 0].y), "=f"(O_reg[ii * 16 + 1].x), "=f"(O_reg[ii * 16 + 1].y), "=f"(O_reg[ii * 16 + 2].x), "=f"(O_reg[ii * 16 + 2].y), "=f"(O_reg[ii * 16 + 3].x), "=f"(O_reg[ii * 16 + 3].y), 
-                            "=f"(O_reg[ii * 16 + 4].x), "=f"(O_reg[ii * 16 + 4].y), "=f"(O_reg[ii * 16 + 5].x), "=f"(O_reg[ii * 16 + 5].y), "=f"(O_reg[ii * 16 + 6].x), "=f"(O_reg[ii * 16 + 6].y), "=f"(O_reg[ii * 16 + 7].x), "=f"(O_reg[ii * 16 + 7].y),
-                            "=f"(O_reg[ii * 16 + 8].x), "=f"(O_reg[ii * 16 + 8].y), "=f"(O_reg[ii * 16 + 9].x), "=f"(O_reg[ii * 16 + 9].y), "=f"(O_reg[ii * 16 + 10].x), "=f"(O_reg[ii * 16 + 10].y), "=f"(O_reg[ii * 16 + 11].x), "=f"(O_reg[ii * 16 + 11].y),
-                            "=f"(O_reg[ii * 16 + 12].x), "=f"(O_reg[ii * 16 + 12].y), "=f"(O_reg[ii * 16 + 13].x), "=f"(O_reg[ii * 16 + 13].y), "=f"(O_reg[ii * 16 + 14].x), "=f"(O_reg[ii * 16 + 14].y), "=f"(O_reg[ii * 16 + 15].x), "=f"(O_reg[ii * 16 + 15].y)
+                            : "=f"(O_reg[0].x), "=f"(O_reg[0].y), "=f"(O_reg[1].x), "=f"(O_reg[1].y), "=f"(O_reg[2].x), "=f"(O_reg[2].y), "=f"(O_reg[3].x), "=f"(O_reg[3].y), 
+                            "=f"(O_reg[4].x), "=f"(O_reg[4].y), "=f"(O_reg[5].x), "=f"(O_reg[5].y), "=f"(O_reg[6].x), "=f"(O_reg[6].y), "=f"(O_reg[7].x), "=f"(O_reg[7].y),
+                            "=f"(O_reg[8].x), "=f"(O_reg[8].y), "=f"(O_reg[9].x), "=f"(O_reg[9].y), "=f"(O_reg[10].x), "=f"(O_reg[10].y), "=f"(O_reg[11].x), "=f"(O_reg[11].y),
+                            "=f"(O_reg[12].x), "=f"(O_reg[12].y), "=f"(O_reg[13].x), "=f"(O_reg[13].y), "=f"(O_reg[14].x), "=f"(O_reg[14].y), "=f"(O_reg[15].x), "=f"(O_reg[15].y)
                             : "r"(O_tm[pipeline_id] + ii * 32));
 
                         if (ii == 0) {
@@ -415,21 +416,24 @@ static void kernel(const __grid_constant__ globals G) {
                             row_sum = L_smem[pipeline_id][warpgroup::laneid()];
                         }
 
+                        asm volatile("{tcgen05.wait::ld.sync.aligned;}");
+
                         #pragma unroll
                         for (int jj = 0; jj < globals::BLOCK_SIZE / 4 / 2; jj++) {
+                            if (blockIdx.x == BLOCKIDX && warpgroup::laneid() == 0 && ii >= 2) printf("%f %f ", O_reg[jj].x, O_reg[jj].y);
                             O_reg[jj].x = __fdividef(O_reg[jj].x, row_sum);
+                            O_reg[jj].y = __fdividef(O_reg[jj].y, row_sum);
                         }
 
-                        // TODO: store async
-                        // TODO: add option in TK to disable TMA swizzle
                         #pragma unroll
                         for (int jj = 0; jj < globals::BLOCK_SIZE / 4 / 2; jj++) {
                             int index = warpgroup::laneid() * globals::BLOCK_SIZE / 4 + // row
-                                        ii * globals::BLOCK_SIZE / 4 + jj * 2;          // column
+                                        jj * 2;// column
                             // TODO: optimize
                             O_smem[pipeline_id][index + 0] = __float2bfloat16(O_reg[jj].x);
                             O_smem[pipeline_id][index + 1] = __float2bfloat16(O_reg[jj].y);
                         }
+                        asm volatile("{fence.proxy.async.shared::cta;}" ::: "memory");
                         warpgroup::sync(5);
                         if (warpgroup::laneid() == 0) {
                             uint64_t tma_ptr = reinterpret_cast<uint64_t>(G.O.template get_tma<globals::O_tile, 2>());
@@ -439,10 +443,14 @@ static void kernel(const __grid_constant__ globals G) {
                                    "r"(task_info.head_idx), "r"(task_info.batch_idx),
                                    "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&O_smem[pipeline_id][0])))
                                  : "memory");
+                            asm volatile("cp.async.bulk.commit_group;");
+                            asm volatile("{cp.async.bulk.wait_group.read %0;}" :: "n"(0) : "memory");
                         }
+                        warpgroup::sync(5);
                     }
-                    warpgroup::tma::store_async_read_wait();
                     warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0); // Next tile PV can proceed
+
+                    if (blockIdx.x == BLOCKIDX && warpgroup::laneid() == 0) printf("\n");
 
                     row_sum = __logf(row_sum); // TODO: use log2f
                     row_sum += row_max;
@@ -507,7 +515,7 @@ static void kernel(const __grid_constant__ globals G) {
                         update_phasebit<1>(phasebits, V_FINISHED_PB_POS + PV_stage);
                         tma::cluster::expect(V_arrived[PV_stage], 0, V_smem[PV_stage]);
                         tma::cluster::load_async(V_smem[PV_stage], G.V, 
-                                                 {task_info.batch_idx, task_info.head_idx, i, cta_id},
+                                                 {task_info.batch_idx, task_info.head_idx, i - 1, cta_id},
                                                  V_arrived[PV_stage], (uint16_t)(1 << cta_id), 0);
                         PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
                     }
