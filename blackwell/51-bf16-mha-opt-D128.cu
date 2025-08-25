@@ -167,7 +167,7 @@ static void kernel(const __grid_constant__ globals G) {
     constexpr float LOG2E = 1.44269504089f;
 
     if (warp_id < 8) { // 2 softmax groups
-        // warpgroup::increase_registers<176>();
+        warpgroup::increase_registers<168>();
         constexpr int S_ARRIVED_PB_POS = 0;
         constexpr int P_FINISHED_PB_POS = 1;
         constexpr int M_FINISHED_PB_POS = 2;
@@ -295,7 +295,7 @@ static void kernel(const __grid_constant__ globals G) {
             }
         }
     } else if (warp_id < 12) { // Scale & epilogue group
-        // warpgroup::decrease_registers<48>();
+        warpgroup::decrease_registers<88>();
         constexpr int O_ARRIVED_PB_POS = 0;
         constexpr int M_ARRIVED_PB_POS = O_ARRIVED_PB_POS + globals::NUM_PIPELINES;
         constexpr int L_ARRIVED_PB_POS = M_ARRIVED_PB_POS + globals::NUM_PIPELINES;;
@@ -411,9 +411,11 @@ static void kernel(const __grid_constant__ globals G) {
                         for (int jj = 0; jj < globals::BLOCK_SIZE / 4 / 2; jj++) {
                             int index = warpgroup::laneid() * globals::BLOCK_SIZE / 4 + // row
                                         jj * 2;// column
-                            // TODO: optimize
-                            O_smem[pipeline_id][index + 0] = __float2bfloat16(O_reg[jj].x);
-                            O_smem[pipeline_id][index + 1] = __float2bfloat16(O_reg[jj].y);
+                            bf16_2 tmp = __float22bfloat162_rn(O_reg[jj]);
+                            // TODO: this is horrible, but apparently it's hidden by all the other ops
+                            asm volatile("{st.shared.b32 [%0], %1;}"
+                                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&O_smem[pipeline_id][index]))), 
+                                   "r"(*reinterpret_cast<uint32_t *>(&tmp)));
                         }
                         asm volatile("{fence.proxy.async.shared::cta;}" ::: "memory");
                         warpgroup::sync(5);
@@ -455,7 +457,7 @@ static void kernel(const __grid_constant__ globals G) {
             }
         }
     } else if (warp_id == 12) { // Loader group
-        // warp::decrease_registers<48>();
+        warp::decrease_registers<48>();
         constexpr int Q_FINISHED_PB_POS = 0;
         constexpr int K_FINISHED_PB_POS = Q_FINISHED_PB_POS + globals::NUM_PIPELINES;
         constexpr int V_FINISHED_PB_POS = K_FINISHED_PB_POS + globals::PIPELINE_STAGES;
@@ -503,7 +505,7 @@ static void kernel(const __grid_constant__ globals G) {
             }
         }
     } else if (warp_id == 13) { // MMA launcher group
-        // warp::decrease_registers<88>();
+        warp::decrease_registers<80>();
         constexpr int Q_ARRIVED_PB_POS = 0;
         constexpr int K_ARRIVED_PB_POS = Q_ARRIVED_PB_POS + globals::NUM_PIPELINES;
         constexpr int V_ARRIVED_PB_POS = K_ARRIVED_PB_POS + globals::PIPELINE_STAGES;
