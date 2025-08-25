@@ -229,7 +229,9 @@ static void kernel(const __grid_constant__ globals G) {
                 if (i > task_info.KV_block_start) {
                     wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
                     update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
-                    M_smem[pipeline_id][warpgroup::laneid()] = O_scale;
+                    asm volatile("{st.shared.b32 [%0], %1;}"
+                        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&M_smem[pipeline_id][warpgroup::laneid()]))),
+                           "f"(O_scale));
                     warpgroup::sync(pipeline_id + 1);
                     warpgroup::arrive(M_arrived[pipeline_id]);
                 }
@@ -285,10 +287,14 @@ static void kernel(const __grid_constant__ globals G) {
                 // Send O scale to correction group
                 wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
                 update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
-                M_smem[pipeline_id][warpgroup::laneid()] = row_max;
+                asm volatile("{st.shared.b32 [%0], %1;}"
+                    :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&M_smem[pipeline_id][warpgroup::laneid()]))),
+                       "f"(row_max));
                 wait(L_finished[pipeline_id], get_phasebit<1>(phasebits, L_FINISHED_PB_POS));
                 update_phasebit<1>(phasebits, L_FINISHED_PB_POS);
-                L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
+                asm volatile("{st.shared.b32 [%0], %1;}"
+                    :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&L_smem[pipeline_id][warpgroup::laneid()]))),
+                       "f"(row_sum));
                 warpgroup::sync(pipeline_id + 1);
                 warpgroup::arrive(M_arrived[pipeline_id]);
                 warpgroup::arrive(L_arrived[pipeline_id]);
@@ -335,7 +341,11 @@ static void kernel(const __grid_constant__ globals G) {
                         if (ii == 0) {
                             wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
                             update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
-                            O_scale_2.x = exp2f(M_smem[pipeline_id][warpgroup::laneid()]);
+                            float tmp;
+                            asm volatile("{ld.shared.b32 %0, [%1];}"
+                                : "=f"(tmp)
+                                : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&M_smem[pipeline_id][warpgroup::laneid()]))));
+                            O_scale_2.x = exp2f(tmp);
                             O_scale_2.y = O_scale_2.x;
                             warpgroup::sync(5);
                             warpgroup::arrive(M_finished[pipeline_id]);
@@ -391,12 +401,18 @@ static void kernel(const __grid_constant__ globals G) {
                         if (ii == 0) {
                             wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
                             update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
-                            row_max = M_smem[pipeline_id][warpgroup::laneid()] * SQRT_D_INV;
+                            float tmp;
+                            asm volatile("{ld.shared.b32 %0, [%1];}"
+                                : "=f"(tmp)
+                                : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&M_smem[pipeline_id][warpgroup::laneid()]))));
+                            row_max = tmp * SQRT_D_INV;
                             warpgroup::sync(5);
                             warpgroup::arrive(M_finished[pipeline_id]);
                             wait(L_arrived[pipeline_id], get_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id));
                             update_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id);
-                            row_sum = L_smem[pipeline_id][warpgroup::laneid()];
+                            asm volatile("{ld.shared.b32 %0, [%1];}"
+                                : "=f"(row_sum)
+                                : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&L_smem[pipeline_id][warpgroup::laneid()]))));
                         }
 
                         asm volatile("{tcgen05.wait::ld.sync.aligned;}");
@@ -440,7 +456,9 @@ static void kernel(const __grid_constant__ globals G) {
                     row_sum += row_max;
                     row_sum *= NEG_SQRT_D;
 
-                    L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
+                    asm volatile("{st.shared.b32 [%0], %1;}"
+                        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&L_smem[pipeline_id][warpgroup::laneid()]))),
+                           "f"(row_sum));
                     warpgroup::sync(5);
                     if (warpgroup::laneid() == 0) { // still skeptical of TK group vector store
                         tma::store_async(G.L, L_smem[pipeline_id],
