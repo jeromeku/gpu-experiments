@@ -29,6 +29,7 @@ CHECK_CORRECTNESS = True
 CHECK_TORCH_REFERENCE = True
 BENCHMARK = False
 BENCHMARK_FA_SM100 = False
+CAUSAL = False
 
 # Input tensors
 print('Generating inputs...')
@@ -60,6 +61,9 @@ if CHECK_CORRECTNESS:
     K.requires_grad = True
     V.requires_grad = True
     S = torch.matmul(Q, K.transpose(-2, -1)) / (D_qk ** 0.5)
+    if CAUSAL:
+        causal_mask = torch.triu(torch.ones((N, N), device="cuda", dtype=torch.bool), diagonal=1)
+        S = S.masked_fill(causal_mask, float('-inf'))
     M = S.max(dim=-1, keepdim=True).values
     P = torch.softmax(S - M, dim=-1)
     O_ref = torch.matmul(P, V)
@@ -81,6 +85,8 @@ if CHECK_CORRECTNESS:
         V_grad_torch = torch.matmul(P.transpose(-2, -1), O_grad)                 # dV = P^T @ dO
         P_grad = torch.matmul(O_grad, V.transpose(-2, -1))                       # dP = dO @ V^T
         S_grad = (P_grad * P - P * (P_grad * P).sum(dim=-1, keepdim=True))       # dS = (diag(P) - P @ P^T) @ dP
+        if CAUSAL:
+            S_grad = S_grad.masked_fill(causal_mask, 0)
         Q_grad_torch = torch.matmul(S_grad, K) / (D_qk ** 0.5)                   # dQ = dS @ K
         K_grad_torch = torch.matmul(S_grad.transpose(-2, -1), Q) / (D_qk ** 0.5) # dK = dS^T @ Q
         check_diff("Q_grad_torch", Q_grad_torch, Q_grad_ref)
@@ -100,6 +106,12 @@ if CHECK_CORRECTNESS:
                 QO_start = i * BLOCK_SIZE
                 QO_end = (i + 1) * BLOCK_SIZE
                 S_ij = Q[:, :, QO_start:QO_end, :] @ K[:, :, KV_start:KV_end, :].transpose(-1, -2) / (D_qk ** 0.5)
+                if CAUSAL:
+                    if j > i:
+                        continue
+                    elif j == i:
+                        block_mask = torch.triu(torch.ones((BLOCK_SIZE, BLOCK_SIZE), device="cuda", dtype=torch.bool), diagonal=1)
+                        S_ij = S_ij.masked_fill(block_mask, float('-inf'))
                 P_grad_ij = O_grad[:, :, QO_start:QO_end, :] @ V[:, :, KV_start:KV_end, :].transpose(-1, -2)
                 P_ij = torch.exp(S_ij.to(torch.float32) - L_ref[:, :, 0, QO_start:QO_end].unsqueeze(-1))
                 S_grad_ij = P_ij * (P_grad_ij.to(torch.float32) - D_vec_ref[:, :, 0, QO_start:QO_end].unsqueeze(-1)) / (D_qk ** 0.5)
@@ -138,7 +150,7 @@ if BENCHMARK:
     times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
     avg_time = np.mean(times) * 1e-3
     std_time = np.std(times) * 1e-3
-    flops = 2 * B * H * N * N * (D_qk + D_vo)
+    flops = 2 * B * H * ((N * N) if (not CAUSAL) else (N * (N + 1) // 2)) * (D_qk + D_vo)
     tflops = flops * 1e-12
 
     print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
@@ -181,7 +193,7 @@ if BENCHMARK:
     times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
     avg_time = np.mean(times) * 1e-3
     std_time = np.std(times) * 1e-3
-    flops = 2 * B * H * N * N * (3 * D_qk + 2 * D_vo)
+    flops = 2 * B * H * ((N * N) if (not CAUSAL) else (N * (N + 1) // 2)) * (3 * D_qk + 2 * D_vo)
     tflops = flops * 1e-12
 
     print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
@@ -190,7 +202,7 @@ if BENCHMARK:
 if BENCHMARK_FA_SM100:
     def flash_attn_fwd(Q, K, V):
         from flash_attn.cute.interface import _flash_attn_fwd
-        _flash_attn_fwd(Q, K, V, causal=False)
+        _flash_attn_fwd(Q, K, V, causal=CAUSAL)
 
     Q_ = Q.transpose(1, 2).contiguous()
     K_ = K.transpose(1, 2).contiguous()
@@ -217,7 +229,7 @@ if BENCHMARK_FA_SM100:
     times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
     avg_time = np.mean(times) * 1e-3
     std_time = np.std(times) * 1e-3
-    flops = 2 * B * H * N * N * (D_qk + D_vo)
+    flops = 2 * B * H * ((N * N) if (not CAUSAL) else (N * (N + 1) // 2)) * (D_qk + D_vo)
     tflops = flops * 1e-12
 
     print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
