@@ -49,7 +49,7 @@
 # SRC := 49-bf16-matmul-launcher-ablation.cu
 # SRC := 50-bf16-mha-D128.cu
 # SRC := 51-bf16-mha-opt-D128.cu
-SRC := 52-bf16-mha-deepseek.cu
+SRC := 52-bf16-mha-dsv.cu
 # SRC := 53-microbenchmarks.cu
 
 # Compiler configuration
