@@ -41,7 +41,7 @@ struct globals {
     using K_tile = st_bf<BLOCK_SIZE / 2, QK_DIM>;          // 16384 B
     using V_tile = st_bf<BLOCK_SIZE, VO_DIM / 2>;          // 16384 B
     using M_vec  = col_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>; // 512   B
-    using L_vec  = col_vec<st_fl<BLOCK_SIZE, VO_DIM>>;     // 512   B
+    using L_vec  = col_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>; // 512   B
     using O_tile = st_bf<BLOCK_SIZE, VO_DIM / 4>;          // 8192  B
 
     using Q_gl = gl<bf16,  -1, -1, -1, -1, Q_tile>; // B, H, N, D
@@ -106,7 +106,7 @@ static void kernel(const __grid_constant__ globals G) {
         sizeof(globals::O_tile) * globals::NUM_PIPELINES +   // 16384 B
         sizeof(globals::L_vec) * globals::NUM_PIPELINES +    // 1024  B
         sizeof(globals::M_vec) * globals::NUM_PIPELINES <=   // 1024  B
-        config::DYNAMIC_SHARED_MEMORY
+        config::DYNAMIC_SHARED_MEMORY - 1024
     );
     globals::Q_tile (&Q_smem)[globals::NUM_PIPELINES]   = sm_allocator.allocate<globals::Q_tile, globals::NUM_PIPELINES>();
     globals::K_tile (&K_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::K_tile, globals::PIPELINE_STAGES>();
@@ -720,16 +720,16 @@ struct globals {
 
     static constexpr int PIPELINE_STAGES = 2;
 
-    using Q_tile  = st_bf<BLOCK_SIZE, QK_DIM>;
-    using K_tile  = st_bf<BLOCK_SIZE, QK_DIM>;
-    using V_tile  = st_bf<BLOCK_SIZE, VO_DIM>;
-    using O_grad_tile = st_bf<BLOCK_SIZE, VO_DIM>;
-    using Q_grad_tile = st_fl<BLOCK_SIZE, QK_DIM>;
-    using K_grad_tile = st_fl<BLOCK_SIZE, QK_DIM>;
-    using V_grad_tile = st_fl<BLOCK_SIZE, VO_DIM>;
-    using L_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>;
-    using D_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>;
-    using SP_tile = st_bf<BLOCK_SIZE, BLOCK_SIZE>; 
+    using Q_tile  = st_bf<BLOCK_SIZE, QK_DIM>;             // 16384 B
+    using K_tile  = st_bf<BLOCK_SIZE, QK_DIM>;             // 16384 B
+    using V_tile  = st_bf<BLOCK_SIZE, VO_DIM>;             // 16384 B
+    using O_grad_tile = st_bf<BLOCK_SIZE, VO_DIM>;         // 16384 B
+    using Q_grad_tile = st_fl<BLOCK_SIZE, QK_DIM>;         // 32768 B
+    using K_grad_tile = st_fl<BLOCK_SIZE, QK_DIM>;         // 32768 B
+    using V_grad_tile = st_fl<BLOCK_SIZE, VO_DIM>;         // 32768 B
+    using L_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>; // 256   B
+    using D_vec  = row_vec<st_fl<BLOCK_SIZE, BLOCK_SIZE>>; // 256   B
+    using SP_tile = st_bf<BLOCK_SIZE, BLOCK_SIZE>;         // 8192  B
 
     using Q_gl = gl<bf16,  -1, -1, -1, -1, Q_tile>;
     using K_gl = gl<bf16,  -1, -1, -1, -1, K_tile>;
@@ -771,25 +771,26 @@ void kernel(const __grid_constant__ globals G) {
 
     // Allocate shared memory
     static_assert(
-        sizeof(globals::Q_tile) * globals::PIPELINE_STAGES +
-        sizeof(globals::K_tile) * config::NUM_CONSUMERS +
-        sizeof(globals::V_tile) * config::NUM_CONSUMERS +
-        sizeof(globals::O_grad_tile) * globals::PIPELINE_STAGES +
-        sizeof(globals::Q_grad_tile) +
-        sizeof(globals::L_vec) * globals::PIPELINE_STAGES +
-        sizeof(globals::D_vec) * globals::PIPELINE_STAGES +
-        sizeof(globals::SP_tile) * config::NUM_CONSUMERS <= config::DYNAMIC_SHARED_MEMORY
+        sizeof(globals::Q_tile) * globals::PIPELINE_STAGES +      // 32768 B
+        sizeof(globals::K_tile) * config::NUM_CONSUMERS +         // 32768 B
+        sizeof(globals::V_tile) * config::NUM_CONSUMERS +         // 32768 B
+        sizeof(globals::O_grad_tile) * globals::PIPELINE_STAGES + // 32768 B
+        sizeof(globals::Q_grad_tile) +                            // 32768 B
+        sizeof(globals::L_vec) * globals::PIPELINE_STAGES +       // 512   B
+        sizeof(globals::D_vec) * globals::PIPELINE_STAGES +       // 512   B
+        sizeof(globals::SP_tile) * config::NUM_CONSUMERS <=       // 16384 B
+        config::DYNAMIC_SHARED_MEMORY - 2048
     );
     globals::Q_tile (&Q_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::Q_tile, globals::PIPELINE_STAGES>();
-    globals::K_tile (&K_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::K_tile, config::NUM_CONSUMERS>();
     globals::V_tile (&V_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::V_tile, config::NUM_CONSUMERS>();
+    globals::K_tile (&K_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::K_tile, config::NUM_CONSUMERS>(); // order matters
     globals::O_grad_tile (&O_grad_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::O_grad_tile, globals::PIPELINE_STAGES>(); 
-    globals::Q_grad_tile (&Q_grad_smem) = sm_allocator.allocate<globals::Q_grad_tile>();
-    globals::K_grad_tile (&K_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::K_grad_tile(*)[config::NUM_CONSUMERS]>(&Q_smem[0].data[0]);
-    globals::V_grad_tile (&V_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::V_grad_tile(*)[config::NUM_CONSUMERS]>(&V_smem[0].data[0]);
+    globals::Q_grad_tile (&Q_grad_smem) = sm_allocator.allocate<globals::Q_grad_tile>(); // order matters
     globals::L_vec (&L_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::L_vec, globals::PIPELINE_STAGES>();
     globals::D_vec (&D_smem)[globals::PIPELINE_STAGES] = sm_allocator.allocate<globals::D_vec, globals::PIPELINE_STAGES>(); 
     globals::SP_tile (&dS_smem)[config::NUM_CONSUMERS] = sm_allocator.allocate<globals::SP_tile, config::NUM_CONSUMERS>();
+    globals::V_grad_tile (&V_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::V_grad_tile(*)[config::NUM_CONSUMERS]>(&Q_smem[0].data[0]);
+    globals::K_grad_tile (&K_grad_smem)[config::NUM_CONSUMERS] = *reinterpret_cast<globals::K_grad_tile(*)[config::NUM_CONSUMERS]>(&O_grad_smem[0].data[0]);
 
     // Allocate tensor memory
     tensor_allocator<1, config::CLUSTER_SIZE> tm_allocator {};
