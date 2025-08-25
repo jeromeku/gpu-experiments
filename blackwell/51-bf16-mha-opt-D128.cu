@@ -569,7 +569,6 @@ static void kernel(const __grid_constant__ globals G) {
                             tma::cluster::wait(S_finished, get_phasebit<1>(phasebits, S_FINISHED_PB_POS));
                             update_phasebit<1>(phasebits, S_FINISHED_PB_POS); // must be updated for every iteration
                             asm volatile("{tcgen05.fence::after_thread_sync;}");
-                            asm volatile("{fence.proxy.async.shared::cta;}");
                             mm2_ABt(S_tm, Q_smem[pipeline_id], K_smem[QK_stage], S_arrived[pipeline_id]);
                             if (pipeline_id == globals::NUM_PIPELINES - 1) {
                                 QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
@@ -587,7 +586,6 @@ static void kernel(const __grid_constant__ globals G) {
                             tma::cluster::wait(O_ready[pipeline_id], get_phasebit<1>(phasebits, O_READY_PB_POS + pipeline_id));
                             update_phasebit<1>(phasebits, O_READY_PB_POS + pipeline_id);
                             asm volatile("{tcgen05.fence::after_thread_sync;}");
-                            asm volatile("{fence.proxy.async.shared::cta;}");
                             if (i == task_info.KV_block_start + 1)
                                 mm2_AB(O_tm[pipeline_id], P_tm[pipeline_id], V_smem[PV_stage], O_arrived[pipeline_id]);
                             else
