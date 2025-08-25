@@ -4,7 +4,7 @@ torch.manual_seed(42)
 torch.set_printoptions(sci_mode=False)
 
 # Import our Python bindings
-# from _C import bf16_mha_fwd, bf16_mha_bwd_prep, bf16_mha_bwd
+from _C import bf16_mha_fwd, bf16_mha_bwd_prep, bf16_mha_bwd
 
 
 def check_diff(name, A, A_ref):
@@ -38,21 +38,21 @@ V =      torch.randn((B, H, N, D_vo), dtype=torch.bfloat16, device="cuda")
 L =      torch.zeros((B, H, 1, N),    dtype=torch.float,    device="cuda")
 O =      torch.zeros((B, H, N, D_vo), dtype=torch.bfloat16, device="cuda")
 D_vec =  torch.empty((B, H, 1, N),    dtype=torch.float,    device="cuda")
-Q_grad = torch.zeros_like(Q,          dtype=torch.float,    device="cuda")
-K_grad = torch.zeros_like(K,          dtype=torch.float,    device="cuda")
-V_grad = torch.zeros_like(V,          dtype=torch.float,    device="cuda")
+Q_grad = torch.zeros_like(Q,          dtype=torch.bfloat16, device="cuda")
+K_grad = torch.zeros_like(K,          dtype=torch.bfloat16, device="cuda")
+V_grad = torch.zeros_like(V,          dtype=torch.bfloat16, device="cuda")
 O_grad = torch.ones_like(O,           dtype=torch.bfloat16, device="cuda")
 
 if CHECK_CORRECTNESS:
     # Run forward kernel
     print("\nRunning forward kernel...")
-    # bf16_mha_fwd(Q, K, V, L, O)
+    bf16_mha_fwd(Q, K, V, L, O)
     torch.cuda.synchronize()
 
     # Run backward kernel
     print("\nRunning backward kernel...")
-    # bf16_mha_bwd_prep(O_grad, O, D_vec)
-    # bf16_mha_bwd(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec)
+    bf16_mha_bwd_prep(O_grad, O, D_vec)
+    bf16_mha_bwd(Q, K, V, O_grad, Q_grad, K_grad, V_grad, L, D_vec)
     torch.cuda.synchronize()
 
     # Run forward reference
@@ -112,9 +112,9 @@ if CHECK_CORRECTNESS:
 
     # Check backward pass
     check_diff("D_vec", D_vec, D_vec_ref)
-    check_diff("Q_grad", Q_grad, Q_grad_ref)
-    check_diff("K_grad", K_grad, K_grad_ref)
-    check_diff("V_grad", V_grad, V_grad_ref)
+    check_diff("Q_grad", Q_grad.to(torch.float32), Q_grad_ref)
+    check_diff("K_grad", K_grad.to(torch.float32), K_grad_ref)
+    check_diff("V_grad", V_grad.to(torch.float32), V_grad_ref)
 
 if BENCHMARK:
     NUM_WARMUPS = 5
