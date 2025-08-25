@@ -38,9 +38,9 @@ V =      torch.randn((B, H, N, D_vo), dtype=torch.bfloat16, device="cuda")
 L =      torch.zeros((B, H, 1, N),    dtype=torch.float,    device="cuda")
 O =      torch.zeros((B, H, N, D_vo), dtype=torch.bfloat16, device="cuda")
 D_vec =  torch.empty((B, H, 1, N),    dtype=torch.float,    device="cuda")
-Q_grad = torch.zeros_like(Q,          dtype=torch.bfloat16, device="cuda")
-K_grad = torch.zeros_like(K,          dtype=torch.bfloat16, device="cuda")
-V_grad = torch.zeros_like(V,          dtype=torch.bfloat16, device="cuda")
+Q_grad = torch.zeros_like(Q,          dtype=torch.float,    device="cuda")
+K_grad = torch.zeros_like(K,          dtype=torch.float,    device="cuda")
+V_grad = torch.zeros_like(V,          dtype=torch.float,    device="cuda")
 O_grad = torch.ones_like(O,           dtype=torch.bfloat16, device="cuda")
 
 if CHECK_CORRECTNESS:
