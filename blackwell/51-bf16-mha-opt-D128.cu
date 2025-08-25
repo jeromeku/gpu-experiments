@@ -5,8 +5,6 @@
 using namespace kittens;
 using namespace kittens::prototype;
 
-constexpr int BLOCKIDX = 1;
-
 namespace bf16_mha_fwd {
 
 struct config {
@@ -184,19 +182,12 @@ static void kernel(const __grid_constant__ globals G) {
         for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
             globals::task_info task_info = get_task_info(G, task_idx);
             if (task_info.batch_idx == -1) break;
-
-            // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Task ID %d-%d\n", pipeline_id, task_idx);
             
             float row_max = std::bit_cast<float>(0xFF800000); // -inf
             float row_sum = 0.f;
 
             for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
-                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("KV index %d-%d\n", pipeline_id, i);
-                
-                // if (warp_id >= 4) softmax_group::sync(1);
-                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Waiting for S = QK finished%d-%d\n", pipeline_id, i);
                 tma::cluster::wait(S_arrived[pipeline_id], get_phasebit<0>(phasebits, S_ARRIVED_PB_POS));
-                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Done waiting for S = QK finished%d-%d\n", pipeline_id, i);
                 update_phasebit<0>(phasebits, S_ARRIVED_PB_POS);
                 warpgroup::arrive(K_finished[QK_stage]);
                 QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
@@ -205,10 +196,8 @@ static void kernel(const __grid_constant__ globals G) {
                     warpgroup::arrive(Q_finished[pipeline_id]);
 
                 // TMEM --> registers
-                // TODO: are all the tcgen05 fences really needed?
                 asm volatile("{tcgen05.fence::after_thread_sync;}");
                 float2 SP_reg[globals::BLOCK_SIZE / 2];
-                // __nanosleep(10000); // <-- culprit?
                 #pragma unroll
                 for (int ii = 0; ii < globals::BLOCK_SIZE / 32; ii++) {
                     asm volatile("{tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];}"
@@ -223,13 +212,10 @@ static void kernel(const __grid_constant__ globals G) {
                 asm volatile("{tcgen05.fence::before_thread_sync;}");
                 warpgroup::sync(pipeline_id + 1);
                 warpgroup::tma::cluster::arrive(S_finished, 0);
-                // if (warp_id < 4) softmax_group::sync(1);
-                // softmax_group::sync(15);
 
                 // Row-wise max
                 #pragma unroll
                 for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ii++) {
-                    // if (blockIdx.x == BLOCKIDX) printf("%f %f ", SP_reg[ii].x, SP_reg[ii].y);
                     asm volatile("{max.f32 %0, %1, %2, %3;}"
                         : "=f"(row_max)
                         : "f"(row_max), "f"(SP_reg[ii].x), "f"(SP_reg[ii].y));
@@ -244,7 +230,6 @@ static void kernel(const __grid_constant__ globals G) {
                     wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
                     update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
                     M_smem[pipeline_id][warpgroup::laneid()] = O_scale;
-                    // __nanosleep(10000);
                     warpgroup::sync(pipeline_id + 1);
                     warpgroup::arrive(M_arrived[pipeline_id]);
                 }
@@ -261,10 +246,7 @@ static void kernel(const __grid_constant__ globals G) {
                 }
 
                 // Registers --> TMEM                
-                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Waiting for PV finished%d-%d\n", pipeline_id, i);
                 wait(P_finished[pipeline_id], get_phasebit<1>(phasebits, P_FINISHED_PB_POS));
-                // __nanosleep(10000); //  <--- culprit?
-                // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Done waiting for PV finished%d-%d\n", pipeline_id, i);
                 update_phasebit<1>(phasebits, P_FINISHED_PB_POS);
                 asm volatile("{tcgen05.fence::after_thread_sync;}");
                 #pragma unroll
@@ -273,7 +255,6 @@ static void kernel(const __grid_constant__ globals G) {
                     #pragma unroll
                     for (int jj = 0; jj < 16; jj++) {
                         SP_bf_reg[jj] = __float22bfloat162_rn(SP_reg[ii * 16 + jj]);
-                        // if (blockIdx.x == BLOCKIDX && threadIdx.x == 0) printf("%f %f ", SP_reg[ii * 16 + jj].x, SP_reg[ii * 16 + jj].y);
                     }
                     asm volatile("{tcgen05.st.sync.aligned.32x32b.x16.b32 [%16], {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15};}"
                         :: "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[0])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[1])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[2])), "r"(*reinterpret_cast<uint32_t *>(&SP_bf_reg[3])),
@@ -283,17 +264,13 @@ static void kernel(const __grid_constant__ globals G) {
                            "r"(P_tm + ii * 16));
                 }
 
-                // if (blockIdx.x == BLOCKIDX) printf("\n");
-
                 // Signal PV launcher
                 asm volatile("{tcgen05.wait::st.sync.aligned;}");
                 asm volatile("{tcgen05.fence::before_thread_sync;}");
-                // __nanosleep(10000);
                 warpgroup::sync(pipeline_id + 1);
                 warpgroup::tma::cluster::arrive(P_arrived[pipeline_id], 0);
 
                 // Get row-wise sum
-                // __nanosleep(10000);
                 float2 local_sum = {0.0f, 0.0f};
                 #pragma unroll
                 for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ii++) {
@@ -303,28 +280,19 @@ static void kernel(const __grid_constant__ globals G) {
                 row_sum += local_sum.x + local_sum.y;
             }
 
-            // printf("\nRow sum %f, row max %f\n", row_sum, row_max);
-
-            // group<8>::sync(7);
-
             // Save for epilogue
-            // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue%d\n", pipeline_id);
             if (task_info.KV_block_start < task_info.KV_block_end) {
                 // Send O scale to correction group
-                // __nanosleep(10000);
                 wait(M_finished[pipeline_id], get_phasebit<1>(phasebits, M_FINISHED_PB_POS));
                 update_phasebit<1>(phasebits, M_FINISHED_PB_POS);
                 M_smem[pipeline_id][warpgroup::laneid()] = row_max;
                 wait(L_finished[pipeline_id], get_phasebit<1>(phasebits, L_FINISHED_PB_POS));
                 update_phasebit<1>(phasebits, L_FINISHED_PB_POS);
                 L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
-                // __nanosleep(10000);
                 warpgroup::sync(pipeline_id + 1);
                 warpgroup::arrive(M_arrived[pipeline_id]);
                 warpgroup::arrive(L_arrived[pipeline_id]);
             }
-            // group<8>::sync(7);
-            // if ((threadIdx.x == 0 || threadIdx.x == 128) && blockIdx.x == BLOCKIDX) printf("Saving for epilogue done%d\n", pipeline_id);
         }
     } else if (warp_id < 12) { // Scale & epilogue group
         // warpgroup::decrease_registers<48>();
@@ -352,7 +320,6 @@ static void kernel(const __grid_constant__ globals G) {
                     float2 O_scale_2;
 
                     asm volatile("{tcgen05.fence::after_thread_sync;}");
-                    // __nanosleep(10000);
                     #pragma unroll
                     for (int ii = 0; ii < 4; ++ii) {
                         // TMEM --> registers
@@ -367,11 +334,9 @@ static void kernel(const __grid_constant__ globals G) {
                         // Initially, load the scale
                         if (ii == 0) {
                             wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
-                            // __nanosleep(10000);
                             update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
                             O_scale_2.x = exp2f(M_smem[pipeline_id][warpgroup::laneid()]);
                             O_scale_2.y = O_scale_2.x;
-                            // __nanosleep(10000);
                             warpgroup::sync(5);
                             warpgroup::arrive(M_finished[pipeline_id]);
                         }
@@ -382,7 +347,6 @@ static void kernel(const __grid_constant__ globals G) {
                             O_reg[jj] = __fmul2_rn(O_reg[jj], O_scale_2);
                         }
 
-                        // __nanosleep(10000);
                         // Registers --> TMEM
                         asm volatile("{tcgen05.st.sync.aligned.32x32b.x32.b32 [%32], {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31};}"
                             :: "f"(O_reg[0].x), "f"(O_reg[0].y), "f"(O_reg[1].x), "f"(O_reg[1].y), "f"(O_reg[2].x), "f"(O_reg[2].y), "f"(O_reg[3].x), "f"(O_reg[3].y), 
@@ -394,7 +358,6 @@ static void kernel(const __grid_constant__ globals G) {
 
                     asm volatile("{tcgen05.wait::st.sync.aligned;}");
                     asm volatile("{tcgen05.fence::before_thread_sync;}");
-                    // __nanosleep(10000);
                     warpgroup::sync(3);
                     warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0);
                 }
@@ -403,8 +366,6 @@ static void kernel(const __grid_constant__ globals G) {
             }
 
             // Epilogue
-            // group<4>::sync(11);
-            // if (warpgroup::laneid() == 0 && blockIdx.x == BLOCKIDX) printf("Starting epilogue\n");
             if (task_info.KV_block_start < task_info.KV_block_end) {
                 #pragma unroll
                 for (int pipeline_id = 0; pipeline_id < globals::NUM_PIPELINES; ++pipeline_id) {
@@ -416,9 +377,7 @@ static void kernel(const __grid_constant__ globals G) {
                     float row_max;
                     float row_sum;
 
-                    // __nanosleep(10000);
                     asm volatile("{tcgen05.fence::after_thread_sync;}");
-                    // __nanosleep(10000);
                     #pragma unroll
                     for (int ii = 0; ii < 4; ++ii) {
                         float2 O_reg[globals::BLOCK_SIZE / 4 / 2];
@@ -432,14 +391,11 @@ static void kernel(const __grid_constant__ globals G) {
                         if (ii == 0) {
                             wait(M_arrived[pipeline_id], get_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id));
                             update_phasebit<0>(phasebits, M_ARRIVED_PB_POS + pipeline_id);
-                            // __nanosleep(10000);
                             row_max = M_smem[pipeline_id][warpgroup::laneid()] * SQRT_D_INV;
-                            // __nanosleep(10000);
                             warpgroup::sync(5);
                             warpgroup::arrive(M_finished[pipeline_id]);
                             wait(L_arrived[pipeline_id], get_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id));
                             update_phasebit<0>(phasebits, L_ARRIVED_PB_POS + pipeline_id);
-                            // __nanosleep(10000);
                             row_sum = L_smem[pipeline_id][warpgroup::laneid()];
                         }
 
@@ -447,7 +403,6 @@ static void kernel(const __grid_constant__ globals G) {
 
                         #pragma unroll
                         for (int jj = 0; jj < globals::BLOCK_SIZE / 4 / 2; jj++) {
-                            // if (blockIdx.x == BLOCKIDX && warpgroup::laneid() == 0 && ii >= 2) printf("%f %f ", O_reg[jj].x, O_reg[jj].y);
                             O_reg[jj].x = __fdividef(O_reg[jj].x, row_sum);
                             O_reg[jj].y = __fdividef(O_reg[jj].y, row_sum);
                         }
@@ -461,7 +416,6 @@ static void kernel(const __grid_constant__ globals G) {
                             O_smem[pipeline_id][index + 1] = __float2bfloat16(O_reg[jj].y);
                         }
                         asm volatile("{fence.proxy.async.shared::cta;}" ::: "memory");
-                        // __nanosleep(10000);
                         warpgroup::sync(5);
                         if (warpgroup::laneid() == 0) {
                             uint64_t tma_ptr = reinterpret_cast<uint64_t>(G.O.template get_tma<globals::O_tile, 2>());
@@ -480,8 +434,6 @@ static void kernel(const __grid_constant__ globals G) {
                     warpgroup::sync(5);
                     warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0); // Next tile PV can proceed
 
-                    // if (blockIdx.x == BLOCKIDX && warpgroup::laneid() == 0) printf("\n");
-
                     row_sum = __logf(row_sum); // TODO: use log2f
                     row_sum += row_max;
                     row_sum *= NEG_SQRT_D;
@@ -489,7 +441,6 @@ static void kernel(const __grid_constant__ globals G) {
                     L_smem[pipeline_id][warpgroup::laneid()] = row_sum;
                     warpgroup::sync(5);
                     if (warpgroup::laneid() == 0) { // still skeptical of TK group vector store
-                        // __nanosleep(10000);
                         tma::store_async(G.L, L_smem[pipeline_id],
                                         {task_info.batch_idx, task_info.head_idx, 0, 
                                         config::CLUSTER_SIZE * globals::NUM_PIPELINES * task_info.Q_block_idx +
@@ -502,8 +453,6 @@ static void kernel(const __grid_constant__ globals G) {
 
                 PV_stage = (PV_stage + 1) % globals::PIPELINE_STAGES;
             }
-            // group<4>::sync(11);
-            // if (warpgroup::laneid() == 0 && blockIdx.x == BLOCKIDX) printf("Done epilogue\n");
         }
     } else if (warp_id == 12) { // Loader group
         // warp::decrease_registers<48>();
@@ -521,7 +470,6 @@ static void kernel(const __grid_constant__ globals G) {
                 for (int pipeline_id = 0; pipeline_id < 2; pipeline_id++) {
                     wait(Q_finished[pipeline_id], get_phasebit<1>(phasebits, Q_FINISHED_PB_POS + pipeline_id));
                     update_phasebit<1>(phasebits, Q_FINISHED_PB_POS + pipeline_id);
-                    // __nanosleep(10000);
                     tma::cluster::expect_bytes(Q_arrived[pipeline_id], sizeof(globals::Q_tile), 0);
                     tma::cluster::load_async(Q_smem[pipeline_id], G.Q,
                                              {task_info.batch_idx, task_info.head_idx, 
@@ -535,7 +483,6 @@ static void kernel(const __grid_constant__ globals G) {
                     if (i < task_info.KV_block_end) {
                         wait(K_finished[QK_stage], get_phasebit<1>(phasebits, K_FINISHED_PB_POS + QK_stage));
                         update_phasebit<1>(phasebits, K_FINISHED_PB_POS + QK_stage);
-                        // __nanosleep(10000);
                         tma::cluster::expect(K_arrived[QK_stage], 0, K_smem[QK_stage]);
                         tma::cluster::load_async(K_smem[QK_stage], G.K, 
                                                  {task_info.batch_idx, task_info.head_idx, 2 * i + cta_id, 0},
@@ -546,7 +493,6 @@ static void kernel(const __grid_constant__ globals G) {
                     if (i > task_info.KV_block_start) {
                         wait(V_finished[PV_stage], get_phasebit<1>(phasebits, V_FINISHED_PB_POS + PV_stage));
                         update_phasebit<1>(phasebits, V_FINISHED_PB_POS + PV_stage);
-                        // __nanosleep(10000);
                         tma::cluster::expect(V_arrived[PV_stage], 0, V_smem[PV_stage]);
                         tma::cluster::load_async(V_smem[PV_stage], G.V, 
                                                  {task_info.batch_idx, task_info.head_idx, i - 1, cta_id},
@@ -555,8 +501,6 @@ static void kernel(const __grid_constant__ globals G) {
                     }
                 }
             }
-
-            // if (blockIdx.x == BLOCKIDX) printf("Loader group done\n");
         }
     } else if (warp_id == 13) { // MMA launcher group
         // warp::decrease_registers<88>();
@@ -606,7 +550,6 @@ static void kernel(const __grid_constant__ globals G) {
                             update_phasebit<1>(phasebits, S_FINISHED_PB_POS); // must be updated for every iteration
                             asm volatile("{tcgen05.fence::after_thread_sync;}");
                             asm volatile("{fence.proxy.async.shared::cta;}");
-                            // __nanosleep(10000);
                             mm2_ABt(S_tm, Q_smem[pipeline_id], K_smem[QK_stage], S_arrived[pipeline_id]);
                             if (pipeline_id == globals::NUM_PIPELINES - 1) {
                                 QK_stage = (QK_stage + 1) % globals::PIPELINE_STAGES;
@@ -625,7 +568,6 @@ static void kernel(const __grid_constant__ globals G) {
                             update_phasebit<1>(phasebits, O_READY_PB_POS + pipeline_id);
                             asm volatile("{tcgen05.fence::after_thread_sync;}");
                             asm volatile("{fence.proxy.async.shared::cta;}");
-                            // __nanosleep(10000);
                             if (i == task_info.KV_block_start + 1)
                                 mm2_AB(O_tm[pipeline_id], P_tm[pipeline_id], V_smem[PV_stage], O_arrived[pipeline_id]);
                             else
@@ -637,8 +579,6 @@ static void kernel(const __grid_constant__ globals G) {
                     }
                 }
             }
-
-            // if (blockIdx.x == BLOCKIDX) printf("MMA group done\n");
         }
     } else if (warp_id == 14 || warp_id == 15) {
         warp::decrease_registers<24>(); // unused warps
@@ -646,8 +586,6 @@ static void kernel(const __grid_constant__ globals G) {
 
     // For TM deallocation
     everyone::tma::cluster::sync();
-
-    // if (blockIdx.x < 8 && threadIdx.x == 0) printf("Everyone Done %d!\n", blockIdx.x);
 }
 
 } // namespace bf16_mha_fwd
