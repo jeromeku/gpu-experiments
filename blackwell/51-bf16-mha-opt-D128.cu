@@ -1,3 +1,12 @@
+/*
+    Optimized forward with a new design.
+
+    Benchmarks (B=8 N=8192 H=128 D=128)
+
+    FWD: 1047.48 TFLOP/s
+    BWD: 608.26 TFLOP/s
+*/
+
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "pyutils/pyutils.cuh"
