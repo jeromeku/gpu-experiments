@@ -1,8 +1,8 @@
 /*
-    Initial benchmarks  (B=8 N=8192 H=128 D=128)
+    Initial benchmarks  (B=8 N=8192 H=128 D=192,128)
 
-    FWD: 1145.97 TFLOP/s
-    BWD: 659.85 TFLOP/s
+    FWD: 1140.36 TFLOP/s
+    BWD: 616.46 TFLOP/s
 */
 
 #include "kittens.cuh"
@@ -82,6 +82,7 @@ __device__ inline globals::task_info get_task_info(const globals &G, int task_id
     task_info.Q_block_idx = task_idx;
 
     task_info.KV_block_start = 0;
+    // TODO: add based on causal
     task_info.KV_block_end = G.K.rows() / globals::BLOCK_SIZE;
 
     if (task_info.batch_idx >= B)
@@ -247,6 +248,7 @@ static void kernel(const __grid_constant__ globals G) {
                 float2 S_scale_2 = {S_scale, S_scale};
                 constexpr float2 log_scale_2 = {LOG2E * SQRT_D_INV, LOG2E * SQRT_D_INV};
 
+                // TODO: mask here. we can actually optimize; apply exp2f only if appropriate. 0 if else
                 #pragma unroll
                 for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ii++) {
                     SP_reg[ii] = __ffma2_rn(SP_reg[ii], log_scale_2, S_scale_2);
@@ -459,7 +461,7 @@ static void kernel(const __grid_constant__ globals G) {
                     warpgroup::sync(5);
                     warpgroup::tma::cluster::arrive(O_ready[pipeline_id], 0); // Next tile PV can proceed
 
-                    row_sum = __logf(row_sum); // TODO: use log2f
+                    row_sum = __logf(row_sum);
                     row_sum += row_max;
                     row_sum *= NEG_SQRT_D;
 
@@ -795,7 +797,8 @@ void kernel(const __grid_constant__ globals G) {
     // Set up mbarriers and launch initial loads
     __shared__ semaphore Q_arrived[globals::PIPELINE_STAGES];
     __shared__ semaphore KV_arrived[config::NUM_CONSUMERS];
-    __shared__ semaphore LD_arrived[globals::PIPELINE_STAGES];
+    __shared__ semaphore L_arrived[globals::PIPELINE_STAGES];
+    __shared__ semaphore D_arrived[globals::PIPELINE_STAGES];
     __shared__ semaphore O_grad_arrived[globals::PIPELINE_STAGES];
     __shared__ semaphore Q_grad_ready;
     __shared__ semaphore matmul_finished[config::NUM_CONSUMERS];
@@ -805,7 +808,8 @@ void kernel(const __grid_constant__ globals G) {
         #pragma unroll
         for (int i = 0; i < globals::PIPELINE_STAGES; i++) {
             init_semaphore(Q_arrived[i], 0, 1);
-            init_semaphore(LD_arrived[i], 0, 1);
+            init_semaphore(L_arrived[i], 0, 1);
+            init_semaphore(D_arrived[i], 0, 1);
             init_semaphore(O_grad_arrived[i], 0, 1); 
             init_semaphore(compute_done[i], 0, 1);
         }
@@ -842,10 +846,9 @@ void kernel(const __grid_constant__ globals G) {
                 wait(compute_done[stage], get_phasebit<1>(phasebits, stage));
                 update_phasebit<1>(phasebits, stage);
 
-                // Load L and D
-                tma::expect_bytes(LD_arrived[stage], sizeof(L_smem[stage]) + sizeof(D_smem[stage]));
-                tma::load_async(L_smem[stage], G.L, {batch_idx, head_idx, 0, i}, LD_arrived[stage]);
-                tma::load_async(D_smem[stage], G.D, {batch_idx, head_idx, 0, i}, LD_arrived[stage]);
+                // Load L
+                tma::expect_bytes(L_arrived[stage], sizeof(L_smem[stage]));
+                tma::load_async(L_smem[stage], G.L, {batch_idx, head_idx, 0, i}, L_arrived[stage]);
 
                 // Load Q
                 tma::expect_bytes(Q_arrived[stage], sizeof(Q_smem[stage]));
@@ -854,6 +857,10 @@ void kernel(const __grid_constant__ globals G) {
                 // Load O_grad
                 tma::expect_bytes(O_grad_arrived[stage], sizeof(O_grad_smem[stage]));
                 tma::load_async(O_grad_smem[stage], G.O_grad, {batch_idx, head_idx, i, 0}, O_grad_arrived[stage]);
+
+                // Load D
+                tma::expect_bytes(D_arrived[stage], sizeof(D_smem[stage]));
+                tma::load_async(D_smem[stage], G.D, {batch_idx, head_idx, 0, i}, D_arrived[stage]);
 
                 stage = (stage + 1) % globals::PIPELINE_STAGES;
             }
@@ -896,8 +903,8 @@ void kernel(const __grid_constant__ globals G) {
         wait(KV_arrived[warpgroup_id], 0);
 
         for (int i = 0; i < num_QO_blocks; i++) {
-            // Wait for L & D to be loaded
-            wait(LD_arrived[stage], get_phasebit<0>(phasebits, stage));
+            // Wait for L to be loaded
+            wait(L_arrived[stage], get_phasebit<0>(phasebits, stage));
 
             // Broadcast the L vec row (1x64) to all of the rows in the S^T tile (64x64)
             // This makes S_t = -LSE * sqrt(d)
@@ -930,6 +937,7 @@ void kernel(const __grid_constant__ globals G) {
             warpgroup::load_async(SP_t_reg, S_t_tm);
             warpgroup::load_async(dSP_t_reg, dP_t_tm);
 
+            // TODO: change to manual, apply mask to S_t like forward
             // S_t = ( (QK^T)^T / sqrt(d) - LSE ) * log2(e)
             warp::mul(SP_t_reg, SP_t_reg, SQRT_D_INV * LOG2E);
             // P_t = S_t = exp( (QK^T)^T / sqrt(d) - LSE )
@@ -941,6 +949,9 @@ void kernel(const __grid_constant__ globals G) {
             warp::copy(SP_t_bf_reg, SP_t_reg);
             warpgroup::store_async(P_t_bf_tm, SP_t_bf_reg);
 
+            // Wait for D to be loaded
+            wait(D_arrived[stage], get_phasebit<0>(phasebits, stage));
+
             // dP_t = (dO @ V^T)^T - D
             #pragma unroll
             for(int ii = 0; ii < 4; ii++) {
@@ -950,6 +961,7 @@ void kernel(const __grid_constant__ globals G) {
                 dSP_t_reg.tiles[0][ii].data[2] = base_ops::sub::template op<float2>(dSP_t_reg.tiles[0][ii].data[2], *(float2*)&D_smem[stage][base_col + 8]);
                 dSP_t_reg.tiles[0][ii].data[3] = base_ops::sub::template op<float2>(dSP_t_reg.tiles[0][ii].data[3], *(float2*)&D_smem[stage][base_col + 8]);
             }
+            // TODO: change this to manual as well, apply mask to dS_t
             // dS_t = P_t * ( (dO @ V^T)^T - D )
             warp::mul(dSP_t_reg, SP_t_reg, dSP_t_reg);
             // dS_t = P_t * ( (dO @ V^T)^T - D ) / sqrt(d)
