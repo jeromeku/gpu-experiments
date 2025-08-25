@@ -1,4 +1,10 @@
 /*
+    WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING
+    The forward kernel has race condition.
+    It's a rewrite of (poorly written) TK B200 MHA implementation anyways.
+    I would rather gnore this file.
+    Start with 51-bf16-mha-opt-D128.cu instead.
+
     Benchmarks (B=8 N=8192 H=128 D=128)
 
     Original ThunderKittens B200 MHA Implementation:
