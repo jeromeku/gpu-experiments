@@ -878,8 +878,9 @@ void kernel(const __grid_constant__ globals G) {
         uint32_t phasebits = 0xFFFF0000;
 
         // Declare K and V TMEM
-        auto K_grad_tm = tm_allocator.allocate<tt<float, 64, 128>>(warpgroup_id, 0);
-        auto V_grad_tm = tm_allocator.allocate<tt<float, 64, 128>>(warpgroup_id, 128);
+        static_assert(globals::QK_DIM * 2 + globals::VO_DIM <= 512);
+        auto K_grad_tm = tm_allocator.allocate<tt<float, 64, globals::QK_DIM>>(warpgroup_id, 0);
+        auto V_grad_tm = tm_allocator.allocate<tt<float, 64, globals::VO_DIM>>(warpgroup_id, globals::QK_DIM);
 
         // Wait for K & V to be loaded
         wait(KV_arrived[warpgroup_id], 0);
