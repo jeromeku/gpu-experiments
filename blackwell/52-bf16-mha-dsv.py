@@ -74,7 +74,7 @@ if CHECK_CORRECTNESS:
     Q_grad_ref = Q.grad.detach()
     K_grad_ref = K.grad.detach()
     V_grad_ref = V.grad.detach()
-    D_vec_ref = (O * O_grad).sum(dim=-1).unsqueeze(2)
+    D_vec_ref = (O_ref * O_grad).sum(dim=-1).unsqueeze(2)
 
     if CHECK_TORCH_REFERENCE:
         # Run backward Pytorch
