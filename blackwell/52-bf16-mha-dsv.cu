@@ -67,6 +67,7 @@ struct globals {
     };
 };
 
+template <bool CAUSAL>
 __device__ inline globals::task_info get_task_info(const globals &G, int task_idx) {
     constexpr int Q_block_size = config::CLUSTER_SIZE * globals::NUM_PIPELINES * globals::BLOCK_SIZE;
 
@@ -82,8 +83,10 @@ __device__ inline globals::task_info get_task_info(const globals &G, int task_id
     task_info.Q_block_idx = task_idx;
 
     task_info.KV_block_start = 0;
-    // TODO: add based on causal
-    task_info.KV_block_end = G.K.rows() / globals::BLOCK_SIZE;
+    if constexpr (CAUSAL)
+        task_info.KV_block_end = (task_info.Q_block_idx + 1) * 4;
+    else
+        task_info.KV_block_end = G.K.rows() / globals::BLOCK_SIZE;
 
     if (task_info.batch_idx >= B)
         return { -1, -1, -1 };
@@ -91,6 +94,7 @@ __device__ inline globals::task_info get_task_info(const globals &G, int task_id
         return task_info;
 }
 
+template <bool CAUSAL>
 __global__ __cluster_dims__(config::CLUSTER_SIZE) __launch_bounds__(config::NUM_THREADS, 1)
 static void kernel(const __grid_constant__ globals G) {
     // Declare shared memory
@@ -173,6 +177,7 @@ static void kernel(const __grid_constant__ globals G) {
     constexpr float SQRT_D_INV = 0.07216878364870323f; // 1 / sqrt(192)
     constexpr float NEG_SQRT_D = -13.856406460551018f; // -sqrt(192)
     constexpr float LOG2E = 1.44269504089f;
+    constexpr float NEG_INFTY = std::bit_cast<float>(0xFF800000);
 
     if (warp_id < 8) { // 2 softmax groups
         warpgroup::increase_registers<168>();
@@ -188,10 +193,10 @@ static void kernel(const __grid_constant__ globals G) {
         uint32_t P_tm = tm_allocator.addr + globals::BLOCK_SIZE + (globals::BLOCK_SIZE / 2) * pipeline_id;
 
         for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
-            globals::task_info task_info = get_task_info(G, task_idx);
+            globals::task_info task_info = get_task_info<CAUSAL>(G, task_idx);
             if (task_info.batch_idx == -1) break;
             
-            float row_max = std::bit_cast<float>(0xFF800000); // -inf
+            float row_max = NEG_INFTY; // -inf
             float row_sum = 0.f;
 
             for (int i = task_info.KV_block_start; i < task_info.KV_block_end; ++i) {
@@ -221,6 +226,29 @@ static void kernel(const __grid_constant__ globals G) {
                 warpgroup::sync(pipeline_id + 1);
                 warpgroup::tma::cluster::arrive(S_finished, 0);
 
+                if constexpr (CAUSAL) {
+                    int Q_block_idx = task_info.Q_block_idx * config::CLUSTER_SIZE * globals::NUM_PIPELINES +
+                                      globals::NUM_PIPELINES * cta_id + pipeline_id;
+                    int &K_block_idx = i;
+                    if (K_block_idx == Q_block_idx) {
+                        int row_idx = warpgroup::laneid();
+                        const int k0 = row_idx >> 1;
+                        #pragma unroll
+                        for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ++ii) {
+                            if (ii > k0) {
+                                SP_reg[ii] = {NEG_INFTY, NEG_INFTY};
+                            } else if (ii == k0 && (row_idx & 0b1) == 0) {
+                                SP_reg[ii].y = NEG_INFTY;
+                            }
+                        }
+                    } else if (K_block_idx > Q_block_idx) {
+                        #pragma unroll
+                        for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ++ii) {
+                            SP_reg[ii] = {NEG_INFTY, NEG_INFTY};
+                        }
+                    }
+                }
+
                 // Row-wise max
                 #pragma unroll
                 for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ii++) {
@@ -244,11 +272,9 @@ static void kernel(const __grid_constant__ globals G) {
                     warpgroup::arrive(M_arrived[pipeline_id]);
                 }
 
-                // Prepare S scales
+                // Prepare S scales and scale
                 float2 S_scale_2 = {S_scale, S_scale};
                 constexpr float2 log_scale_2 = {LOG2E * SQRT_D_INV, LOG2E * SQRT_D_INV};
-
-                // TODO: mask here. we can actually optimize; apply exp2f only if appropriate. 0 if else
                 #pragma unroll
                 for (int ii = 0; ii < globals::BLOCK_SIZE / 2; ii++) {
                     SP_reg[ii] = __ffma2_rn(SP_reg[ii], log_scale_2, S_scale_2);
@@ -321,7 +347,7 @@ static void kernel(const __grid_constant__ globals G) {
         };
 
         for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
-            globals::task_info task_info = get_task_info(G, task_idx);
+            globals::task_info task_info = get_task_info<CAUSAL>(G, task_idx);
             if (task_info.batch_idx == -1) break;
 
             for (int i = task_info.KV_block_start + 1; i < task_info.KV_block_end; ++i) { // skip the first iteration
@@ -491,7 +517,7 @@ static void kernel(const __grid_constant__ globals G) {
 
         if (lane_id == 0) {
             for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
-                globals::task_info task_info = get_task_info(G, task_idx);
+                globals::task_info task_info = get_task_info<CAUSAL>(G, task_idx);
                 if (task_info.batch_idx == -1) break;
 
                 // Load Q
@@ -554,7 +580,7 @@ static void kernel(const __grid_constant__ globals G) {
             };
     
             for (int task_idx = cluster_id; true; task_idx += gridDim.x / config::CLUSTER_SIZE) {
-                globals::task_info task_info = get_task_info(G, task_idx);
+                globals::task_info task_info = get_task_info<CAUSAL>(G, task_idx);
                 if (task_info.batch_idx == -1) break;
 
                 // Wait for Q arrival
@@ -1041,7 +1067,14 @@ void kernel(const __grid_constant__ globals G) {
 
 PYBIND11_MODULE(_C, m) {
     m.doc() = "";
-    py::bind_kernel<bf16_mha_fwd::kernel>(m, "bf16_mha_fwd",
+    py::bind_kernel<bf16_mha_fwd::kernel<false>>(m, "bf16_mha_fwd_noncausal",
+        &bf16_mha_fwd::globals::Q,
+        &bf16_mha_fwd::globals::K,
+        &bf16_mha_fwd::globals::V,
+        &bf16_mha_fwd::globals::L,
+        &bf16_mha_fwd::globals::O
+    );
+    py::bind_kernel<bf16_mha_fwd::kernel<true>>(m, "bf16_mha_fwd_causal",
         &bf16_mha_fwd::globals::Q,
         &bf16_mha_fwd::globals::K,
         &bf16_mha_fwd::globals::V,
@@ -1053,7 +1086,18 @@ PYBIND11_MODULE(_C, m) {
         &bf16_mha_bwd_prep::globals::O,
         &bf16_mha_bwd_prep::globals::D
     );
-    py::bind_kernel<bf16_mha_bwd::kernel>(m, "bf16_mha_bwd",
+    py::bind_kernel<bf16_mha_bwd::kernel>(m, "bf16_mha_bwd_noncausal",
+        &bf16_mha_bwd::globals::Q,
+        &bf16_mha_bwd::globals::K,
+        &bf16_mha_bwd::globals::V,
+        &bf16_mha_bwd::globals::O_grad,
+        &bf16_mha_bwd::globals::Q_grad,
+        &bf16_mha_bwd::globals::K_grad,
+        &bf16_mha_bwd::globals::V_grad,
+        &bf16_mha_bwd::globals::L,
+        &bf16_mha_bwd::globals::D
+    );
+    py::bind_kernel<bf16_mha_bwd::kernel>(m, "bf16_mha_bwd_causal",
         &bf16_mha_bwd::globals::Q,
         &bf16_mha_bwd::globals::K,
         &bf16_mha_bwd::globals::V,

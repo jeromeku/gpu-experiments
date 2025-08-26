@@ -4,7 +4,13 @@ torch.manual_seed(42)
 torch.set_printoptions(sci_mode=False)
 
 # Import our Python bindings
-from _C import bf16_mha_fwd, bf16_mha_bwd_prep, bf16_mha_bwd
+from _C import (
+    bf16_mha_fwd_noncausal,
+    bf16_mha_fwd_causal,
+    bf16_mha_bwd_prep,
+    bf16_mha_bwd_noncausal,
+    bf16_mha_bwd_causal
+)
 
 
 def check_diff(name, A, A_ref):
@@ -29,7 +35,15 @@ CHECK_CORRECTNESS = True
 CHECK_TORCH_REFERENCE = True
 BENCHMARK = False
 BENCHMARK_FA_SM100 = False
-CAUSAL = False
+CAUSAL = True
+
+# Decide which kernel to run
+if CAUSAL:
+    bf16_mha_fwd = bf16_mha_fwd_causal
+    bf16_mha_bwd = bf16_mha_bwd_causal
+else:
+    bf16_mha_fwd = bf16_mha_fwd_noncausal
+    bf16_mha_bwd = bf16_mha_bwd_noncausal
 
 # Input tensors
 print('Generating inputs...')
