@@ -69,44 +69,35 @@ def all_to_all_4D(
         N = N_per_rank * num_ranks
         H_per_rank = H // num_ranks
 
-        input_t = (
-            input.reshape(B, N_per_rank, num_ranks, H_per_rank, D)
-                .transpose(0, 2) # (num_ranks, N_per_rank, B, H_per_rank, D)
-                .contiguous()
-        )
-        output = torch.empty_like(input_t)
-
+        input_t = input.view(B, N_per_rank, num_ranks, H_per_rank, D).permute(2, 1, 0, 3, 4).contiguous()
+        
         if num_ranks > 1:
+            output = torch.empty_like(input_t)
             torch.distributed.all_to_all_single(output, input_t, group=group)
             if sync:
                 torch.cuda.synchronize()
         else:
             output = input_t
 
-        return output.reshape(N, B, H_per_rank, D).transpose(0, 1).contiguous() # (B, N, H_per_rank, D)
-
+        return output.permute(2, 0, 1, 3, 4).reshape(B, N_per_rank * num_ranks, H_per_rank, D)
+    
     elif scatter_idx == 1 and gather_idx == 2:
         B, N, H_per_rank, D = input.shape
         H = H_per_rank * num_ranks
         N_per_rank = N // num_ranks
-        num_ranks = torch.distributed.get_world_size(group)
 
-        input_t = (
-            input.reshape(B, num_ranks, N_per_rank, H_per_rank, D)
-                .permute(1, 3, 2, 0, 4) # (num_ranks, H_per_rank, N_per_rank, B, D)
-                .contiguous()
-        )
-        output = torch.empty_like(input_t)
-
+        input_t = input.view(B, num_ranks, N_per_rank, H_per_rank, D).permute(1, 3, 2, 0, 4).contiguous()
+        
         if num_ranks > 1:
+            output = torch.empty_like(input_t)
             torch.distributed.all_to_all_single(output, input_t, group=group)
             if sync:
                 torch.cuda.synchronize()
         else:
             output = input_t
 
-        return output.reshape(H, N_per_rank, B, D).transpose(0, 2).contiguous() # (B, N_per_rank, H, D)
-
+        return output.permute(3, 2, 0, 1, 4).reshape(B, N_per_rank, H_per_rank * num_ranks, D)
+    
     else:
         raise RuntimeError("scatter_idx must be 1 or 2 and gather_idx must be 1 or 2")
 
