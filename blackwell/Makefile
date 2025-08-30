@@ -51,7 +51,8 @@
 # SRC := 51-bf16-mha-opt-D128.cu
 # SRC := 52-bf16-mha-dsv.cu
 # SRC := 53-microbenchmarks.cu
-SRC := 54-multi-node-ib.cu
+# SRC := 54-multi-node-ib.cu
+SRC := 57-tcgen05-bf16-mma-smallM.cu
 
 # Binaries
 NVCC := nvcc
@@ -66,14 +67,14 @@ THUNDERKITTENS_ROOT := ../ThunderKittens
 # RUN_CMD := ./$(OUT)
 
 # Python binding configuration
-# PYTHON_VERSION := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")
-# PYTHON_LIBDIR := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
-# PYBIND_INCLUDES := $(shell python3 -m pybind11 --includes)
-# EXT_SUFFIX := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-# NVCCFLAGS += -shared -fPIC
-# NVCCFLAGS += $(PYBIND_INCLUDES) -L${PYTHON_LIBDIR} -lpython${PYTHON_VERSION}
-# OUT := _C$(EXT_SUFFIX)
-# RUN_CMD := python3 $(basename $(SRC)).py
+PYTHON_VERSION := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")
+PYTHON_LIBDIR := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+PYBIND_INCLUDES := $(shell python3 -m pybind11 --includes)
+EXT_SUFFIX := $(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+NVCCFLAGS += -shared -fPIC
+NVCCFLAGS += $(PYBIND_INCLUDES) -L${PYTHON_LIBDIR} -lpython${PYTHON_VERSION}
+OUT := _C$(EXT_SUFFIX)
+RUN_CMD := python3 $(basename $(SRC)).py
 
 # PyTorch binding configuration
 # PYTORCH_INCLUDES := $(shell python3 -c "from torch.utils.cpp_extension import include_paths; print(' '.join(['-I' + p for p in include_paths()]))")
@@ -83,9 +84,9 @@ THUNDERKITTENS_ROOT := ../ThunderKittens
 # NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
 
 # MPI configuration
-NVCCFLAGS += -ccbin ${MPICC}
-OUT := $(basename $(SRC)).out
-RUN_CMD := $(MPIRUN) -np 8 ./$(OUT)
+# NVCCFLAGS += -ccbin ${MPICC}
+# OUT := $(basename $(SRC)).out
+# RUN_CMD := $(MPIRUN) -np 8 ./$(OUT)
 
 # NVCC flags
 NVCCFLAGS += -DNDEBUG -lineinfo
