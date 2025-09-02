@@ -52,7 +52,8 @@
 # SRC := 52-bf16-mha-dsv.cu
 # SRC := 53-microbenchmarks.cu
 # SRC := 54-multi-node-ib.cu
-SRC := 57-tcgen05-bf16-mma-smallM.cu
+# SRC := 57-tcgen05-bf16-mma-smallM.cu
+SRC := 58-tensor-ipc.cu
 
 # Binaries
 NVCC := nvcc
