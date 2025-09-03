@@ -129,32 +129,28 @@ for i in range(world_size):
 # Benchmark
 NUM_WARMUPS = 5
 NUM_ITERS = 10
+
 chunk_size = (N // world_size) * (H // world_size) * D * 2 # chunk sent from one rank to another
 per_rank_comm_size = chunk_size * (world_size - 1)
 total_comm_size = per_rank_comm_size * world_size # N * (N - 1) * chunk_size
-l2_cache = torch.empty(1024 * 1024 * 64, dtype=torch.bfloat16, device=device)
+
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
 
 for i in range(NUM_WARMUPS):
     all2all_ref(src, scatter_idx=2, gather_idx=1)
 torch.distributed.barrier()
 torch.cuda.synchronize()
 
-times = []
-start_event = torch.cuda.Event(enable_timing=True)
-end_event = torch.cuda.Event(enable_timing=True)
-
+start_event.record()
 for i in range(NUM_ITERS):
-    l2_cache.random_()
-    torch.distributed.barrier()
-    torch.cuda.synchronize()
-    start_event.record()
     all2all_ref(src, scatter_idx=2, gather_idx=1)
-    end_event.record()
-    torch.cuda.synchronize()
-    times.append(start_event.elapsed_time(end_event) * 1e-3)
+end_event.record()
+torch.distributed.barrier()
+torch.cuda.synchronize()
 
-avg_time = np.mean(times)
-std_time = np.std(times)
+total_time = start_event.elapsed_time(end_event) * 1e-3
+avg_time = total_time / NUM_ITERS
 
 if rank == 0:
     print("\nB200 Max Unidirectional NVL Bandwidth: 900 GB/s")
@@ -162,7 +158,7 @@ if rank == 0:
 
 for i in range(world_size):
     if i == rank:
-        print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
+        print(f'Time taken: {avg_time * 1e6:.2f} us')
         print(f'Unidirectional Bandwidth, USP: {per_rank_comm_size * 1e-9 / avg_time:.2f} GB/s')
     torch.distributed.barrier()
 
@@ -171,22 +167,15 @@ for i in range(NUM_WARMUPS):
 torch.distributed.barrier()
 torch.cuda.synchronize()
 
-times = []
-start_event = torch.cuda.Event(enable_timing=True)
-end_event = torch.cuda.Event(enable_timing=True)
-
+start_event.record()
 for i in range(NUM_ITERS):
-    l2_cache.random_()
-    torch.distributed.barrier()
-    torch.cuda.synchronize()
-    start_event.record()
     all2all(dst, src, broker)
-    end_event.record()
-    torch.cuda.synchronize()
-    times.append(start_event.elapsed_time(end_event) * 1e-3)
+end_event.record()
+torch.distributed.barrier()
+torch.cuda.synchronize()
 
-avg_time = np.mean(times)
-std_time = np.std(times)
+total_time = start_event.elapsed_time(end_event) * 1e-3
+avg_time = total_time / NUM_ITERS
 
 if rank == 0:
     print("\nB200 Max Unidirectional NVL Bandwidth: 900 GB/s")
@@ -194,7 +183,7 @@ if rank == 0:
 
 for i in range(world_size):
     if i == rank:
-        print(f'Time taken: {avg_time * 1e6:.2f} ± {std_time * 1e6:.2f} us')
+        print(f'Time taken: {avg_time * 1e6:.2f} us')
         print(f'Unidirectional Bandwidth, USP: {per_rank_comm_size * 1e-9 / avg_time:.2f} GB/s')
     torch.distributed.barrier()
 
