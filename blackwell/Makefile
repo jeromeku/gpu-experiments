@@ -63,7 +63,7 @@ MPICC := mpicxx
 MPIRUN := mpirun
 
 # ThunderKittens configuration
-THUNDERKITTENS_ROOT ?= ../ThunderKittens
+THUNDERKITTENS_ROOT := ../ThunderKittens
 
 # Python binding configuration
 # These take a while to load. You can bypass them by defining them as environment variables in advance
