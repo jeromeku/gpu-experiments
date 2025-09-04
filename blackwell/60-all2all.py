@@ -189,20 +189,22 @@ for i in range(world_size):
 torch.cuda.synchronize()
 
 # Profile
-with torch.profiler.profile(
-    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-    record_shapes=True,
-    profile_memory=True,
-    with_modules=True,
-    with_stack=True
-) as profiler:
-    for i in range(NUM_WARMUPS + NUM_ITERS):
-        all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
+profile_enabled = False
+if profile_enabled:
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_modules=True,
+        with_stack=True
+    ) as profiler:
+        for i in range(NUM_WARMUPS + NUM_ITERS):
+            all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
 
-# Export to Chrome trace format
-profiler.export_chrome_trace(f"all2all_rank{rank}.json")
-if rank == 0:
-    print(f"\nProfiler trace exported to all2all_rankN.json")
+    # Export to Chrome trace format
+    profiler.export_chrome_trace(f"all2all_rank{rank}.json")
+    if rank == 0:
+        print(f"\nProfiler trace exported to all2all_rankN.json")
 
 # Clean up
 torch.distributed.destroy_process_group()
