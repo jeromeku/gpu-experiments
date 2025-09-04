@@ -108,12 +108,18 @@ NVCCFLAGS += -diag-suppress 3189
 # RUN_CMD := python3 $(basename $(SRC)).py
 
 # 3. PyTorch binding configuration
+# NVCCFLAGS += -shared -fPIC
+# NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
+# OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+# RUN_CMD := python3 $(basename $(SRC)).py
+
+# 4. PyTorch + Torchrun binding configuration
 NVCCFLAGS += -shared -fPIC
 NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
 OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-RUN_CMD := python3 $(basename $(SRC)).py
+RUN_CMD := torchrun --nproc_per_node=8 $(basename $(SRC)).py
 
-# 4. MPI configuration
+# 5. MPI configuration
 # NVCCFLAGS += -ccbin ${MPICC}
 # OUT := $(basename $(SRC)).out
 # RUN_CMD := $(MPIRUN) -np 8 ./$(OUT)
