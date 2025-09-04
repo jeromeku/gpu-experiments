@@ -96,9 +96,6 @@ torch.distributed.init_process_group(
     timeout=timedelta(seconds=30),
 )
 
-# Initialize KittensBroker
-broker = KittensBroker(local_rank, local_world_size)
-
 # Print global parameters
 if rank == 0:
     print(f"N: {N}, H: {H}, D: {D}")
@@ -108,13 +105,18 @@ torch.random.manual_seed(rank + 42)
 src = torch.randn(1, N // world_size, H, D, dtype=torch.bfloat16, device=device)
 dst = torch.zeros(1, N, H // world_size, D, dtype=torch.bfloat16, device=device)
 
+# Initialize KittensBroker and KittensBond
+broker = KittensBroker(local_rank, local_world_size)
+src_ipc_ptrs = broker.gather_ipc_ptrs(src)
+dst_ipc_ptrs = broker.gather_ipc_ptrs(dst)
+
 # Run PyTorch reference
 dst_ref = all2all_ref(src, scatter_idx=2, gather_idx=1)
 torch.distributed.barrier()
 torch.cuda.synchronize()
 
 # Run kernel
-all2all(dst, src, broker)
+all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
 torch.distributed.barrier()
 torch.cuda.synchronize()
 
@@ -161,13 +163,13 @@ for i in range(world_size):
     torch.distributed.barrier()
 
 for i in range(NUM_WARMUPS):
-    all2all(dst, src, broker)
+    all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
 torch.distributed.barrier()
 torch.cuda.synchronize()
 
 start_event.record()
 for i in range(NUM_ITERS):
-    all2all(dst, src, broker)
+    all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
 end_event.record()
 torch.distributed.barrier()
 torch.cuda.synchronize()
@@ -195,7 +197,7 @@ with torch.profiler.profile(
     with_stack=True
 ) as profiler:
     for i in range(NUM_WARMUPS + NUM_ITERS):
-        all2all(dst, src, broker)
+        all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
 
 # Export to Chrome trace format
 profiler.export_chrome_trace(f"all2all_rank{rank}.json")

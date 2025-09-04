@@ -6,7 +6,6 @@
 
 #include "kittens.cuh"
 #include "prototype.cuh"
-#include "pyutils/pyutils.cuh"
 #include "pyutils/torchutils.cuh"
 
 using namespace kittens;
@@ -143,16 +142,19 @@ __device__ inline void kernel(const globals &G) {
     }
 }
 
-void entrypoint(const at::Tensor &dst, const at::Tensor &src, KittensBroker &broker) {
+void entrypoint(
+    const at::Tensor &dst,
+    const KittensIPCPointerSet &dst_ipc_ptrs,
+    const at::Tensor &src,
+    const KittensIPCPointerSet &src_ipc_ptrs,
+    const KittensBroker &broker
+) {
     kittens::py::device_check(dst, src);
-
-    KittensBond src_bonds[globals::NUM_DEVICES];
-    KittensBond dst_bonds[globals::NUM_DEVICES];
 
     // Instantiate globals
     globals G {
-        .src = kittens::py::tensor_to_pgl<typename globals::parallel_layout>(src, broker, src_bonds),
-        .dst = kittens::py::tensor_to_pgl<typename globals::parallel_layout>(dst, broker, dst_bonds),
+        .src = kittens::py::tensor_to_pgl<typename globals::parallel_layout>(src, src_ipc_ptrs, broker),
+        .dst = kittens::py::tensor_to_pgl<typename globals::parallel_layout>(dst, dst_ipc_ptrs, broker),
         .dev_idx = broker.local_rank_
     };
 
@@ -162,6 +164,12 @@ void entrypoint(const at::Tensor &dst, const at::Tensor &src, KittensBroker &bro
 
 PYBIND11_MODULE(_C, m) {
     pybind11::class_<KittensBroker>(m, "KittensBroker")
-        .def(pybind11::init<int, int>());
+        .def(pybind11::init<int,int>())
+        .def("gather_ipc_ptrs",
+            pybind11::overload_cast<const at::Tensor&>(&KittensBroker::gather_ipc_ptrs),
+            pybind11::call_guard<pybind11::gil_scoped_release>(),
+            pybind11::return_value_policy::move);
+    pybind11::class_<KittensIPCPointerSet>(m, "KittensIPCPointerSet")
+        .def(pybind11::init<>());
     m.def("all2all", &entrypoint);
 }

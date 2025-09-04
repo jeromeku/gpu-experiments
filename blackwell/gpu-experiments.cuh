@@ -23,7 +23,7 @@
 
 // Pybind11
 #include <pybind11/pybind11.h>
-namespace py = pybind11;
+#include <pybind11/stl.h>
 
 // CUDA driver API
 #define CUCHECK(cmd) do {                                     \
