@@ -12,3 +12,6 @@ gmon.out
 *.out
 *.so
 *.png
+
+# Profiler files
+*.json 

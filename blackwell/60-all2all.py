@@ -4,9 +4,7 @@ torchrun --nproc_per_node=8 60-all2all.py
 
 from datetime import timedelta
 import os
-import time
 
-import numpy as np
 import torch
 import torch.distributed
 torch.set_printoptions(sci_mode=False)
@@ -186,6 +184,23 @@ for i in range(world_size):
         print(f'Time taken: {avg_time * 1e6:.2f} us')
         print(f'Unidirectional Bandwidth, USP: {per_rank_comm_size * 1e-9 / avg_time:.2f} GB/s')
     torch.distributed.barrier()
+torch.cuda.synchronize()
+
+# Profile
+with torch.profiler.profile(
+    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+    record_shapes=True,
+    profile_memory=True,
+    with_modules=True,
+    with_stack=True
+) as profiler:
+    for i in range(NUM_WARMUPS + NUM_ITERS):
+        all2all(dst, src, broker)
+
+# Export to Chrome trace format
+profiler.export_chrome_trace(f"all2all_rank{rank}.json")
+if rank == 0:
+    print(f"\nProfiler trace exported to all2all_rankN.json")
 
 # Clean up
 torch.distributed.destroy_process_group()
