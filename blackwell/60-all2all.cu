@@ -147,7 +147,7 @@ void entrypoint(
     const KittensIPCPointerSet &dst_ipc_ptrs,
     const at::Tensor &src,
     const KittensIPCPointerSet &src_ipc_ptrs,
-    const KittensBroker &broker
+    KittensBroker &broker
 ) {
     kittens::py::device_check(dst, src);
 
