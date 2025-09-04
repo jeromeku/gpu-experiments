@@ -132,7 +132,6 @@ TARGET=$(basename $(SRC))
 #   Requirements:
 #   - Thunderkittens repo in $(WORKING_DIR)/thunderkittens
 #   - NCU in $(WORKING_DIR)/ncu
-# WORKING_DIR=/home/rahul/stuart
 WORKING_DIR=/scratch/stuart
 
 # Default target
