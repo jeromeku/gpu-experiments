@@ -7,13 +7,16 @@ I originally created this repository to learn CUDA through hands-on coding. Now,
 ## Requirements
 
 - Thunderkittens
-- NCU in $HOME/ncu
-- CUDA in /usr/local/cuda-12
-- LD_LIBRARY_PATH configured
-- `uftrace` installed (https://uftrace.github.io/slide/#6)
+- CUDA 12.8 or above
+- Hopper or Blackwell GPUs
 
 Everything should be done through the Makefile.
 
-Everything targets H100 (sm_90a)
+## Topics
 
-For nccl, custom build was made with `make -j src.build NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90a"`, after adding debug/profiler flags (`-finstrument-functions -pg -g`) to the nccl makefile manually.
+- A lot of random micro-experiments 
+- Multi-GPU
+- MXFP8
+- IPC
+- Attention
+
