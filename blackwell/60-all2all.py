@@ -76,7 +76,7 @@ def all2all_ref(
 
 
 # Parameters
-N = 65536
+N = 131072
 H = 128
 D = 128
 

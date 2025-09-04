@@ -1,8 +1,27 @@
 /*
     Goal: implement fast single-node all2all collective communication
+
+    Benchmarks (N: 131072, H: 128, D: 128, 8 GPUs, rank 0 only, Unidirectional NVL bandwidth):
+
+        NCCL: 319.01 GB/s
+        Naive 1-stage persistent-grid: 642.21 GB/s
+        Naive 2-stage persistent-grid: 630.59 GB/s
+        Naive 4-stage persistent-grid: 628.76 GB/s
+        Naive 8-stage persistent-grid: 632.25 GB/s
+        Naive 16-stage persistent-grid: 627.79 GB/s
+        Stage-parllel 1-stage persistent-grid: 645.83 GB/s
+        Stage-parllel 2-stage persistent-grid: 615.85 GB/s
+        Stage-parllel 4-stage persistent-grid: 641.20 GB/s
+        Stage-parllel 8-stage persistent-grid: 627.09 GB/s
+        Stage-parllel 16-stage persistent-grid: 557.56 GB/s
+        Stage-parllel 32-stage persistent-grid: 496.32 GB/s
+        Non-persistent-grid: 693.37 GB/s
+
+    Conclusion:
+        - It always seems to be the case that for memory-bound workloads, non-persistent-grid is faster.
 */
 
-#include <torch/extension.h>
+#include <torch/csrc/utils/pybind.h>
 
 #include "kittens.cuh"
 #include "prototype.cuh"
@@ -13,19 +32,14 @@ using namespace kittens::prototype;
 
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
-    static constexpr int NUM_BLOCKS = 148; // TODO: vary this
-    static constexpr int STATIC_SHARED_MEMORY = 128;
-    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
-
-    static constexpr int NUM_WARPS = 2;
-    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static constexpr int NUM_THREADS = 1;
 };
 
 struct globals {
     static constexpr int NUM_DEVICES = 8;
     static constexpr int ROW_BLOCK_SIZE = 16;
     static constexpr int COL_BLOCK_SIZE = 128;
-    static constexpr int PIPELINE_STAGES = 16;
+    // static constexpr int PIPELINE_STAGES = 16;
 
     using tile = st_bf<ROW_BLOCK_SIZE, COL_BLOCK_SIZE>;
     using parallel_layout = pgl<gl<bf16, -1, -1, -1, -1, tma::descriptor<tile, 2, false>>, NUM_DEVICES, false>;
@@ -33,6 +47,16 @@ struct globals {
     parallel_layout src;
     parallel_layout dst;
     const int dev_idx;
+
+    __host__ inline dim3 grid() const { 
+        return dim3(src.batch() *
+                    src.depth() * 
+                    (src.rows() / globals::ROW_BLOCK_SIZE) *
+                    (src.cols() / globals::COL_BLOCK_SIZE)); 
+    }
+    __host__ inline int dynamic_shared_memory() const {
+        return static_cast<int>(sizeof(tile) + 1024);
+    }
 };
 
 __device__ inline int4 get_indices(const globals &G, int task_id) {
@@ -54,92 +78,50 @@ __device__ inline int4 get_indices(const globals &G, int task_id) {
 
 template <int SCATTER_AXIS = 2, int GATHER_AXIS = 1>
 __device__ inline void kernel(const globals &G) {
-    // Shared memory declaration
+    // Allocate shared memory
     extern __shared__ int __shm[];
     tma_swizzle_allocator allocator((int*)&__shm[0]);
+    globals::tile &tile = allocator.allocate<globals::tile>();
 
-    // Warp configuration
-    const int warp_id = kittens::warpid();
-    const int lane_id = warp::laneid();
+    // Retrieve indices
+    int4 indices = get_indices(G, blockIdx.x);
 
-    // Allocate shared memory
-    static_assert(sizeof(globals::tile) * globals::PIPELINE_STAGES <= config::DYNAMIC_SHARED_MEMORY);
-    globals::tile (&tiles)[globals::PIPELINE_STAGES] = allocator.allocate<globals::tile, globals::PIPELINE_STAGES>();
+    // Set up mbarrier
+    __shared__ semaphore inputs_arrived;
+    init_semaphore(inputs_arrived, 0, 1);
 
-    // Set up mbarriers
-    __shared__ semaphore inputs_arrived[globals::PIPELINE_STAGES];
-    __shared__ semaphore inputs_finished[globals::PIPELINE_STAGES];
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < globals::PIPELINE_STAGES; ++i) {
-            init_semaphore(inputs_arrived[i], 0, 1);
-            init_semaphore(inputs_finished[i], 0, 1);
-        }
-    }
-    __syncthreads();
+    // Initiate the load
+    tma::expect_bytes(inputs_arrived, sizeof(globals::tile));
+    asm volatile("{cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 [%0], [%1, {%2, %3, %4, %5}], [%6];}"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&tile[0]))), 
+            "l"(G.src[G.dev_idx].template get_tma<globals::tile, 2>()), 
+            "r"(indices.w * globals::COL_BLOCK_SIZE), "r"(indices.z * globals::ROW_BLOCK_SIZE), "r"(indices.y), "r"(indices.x),
+            "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&inputs_arrived)))
+        : "memory");
 
-    // Declare stage and phasebits for semaphore waits
-    int stage = 0;
-    uint32_t phasebits = 0xFFFF0000;
+    // Calculate scatter and gather blocks per device
+    const int scatter_blocks_per_dev = G.src.rows() / globals::ROW_BLOCK_SIZE / globals::NUM_DEVICES;
+    const int gather_blocks_per_dev = G.dst.depth() / globals::NUM_DEVICES; // important to use dst not src
 
-    // Main divergence
-    if (warp_id == 0 && lane_id < globals::PIPELINE_STAGES) {
-        for (int task_id = blockIdx.x; true; task_id += gridDim.x) {
-            int4 indices = get_indices(G, task_id);
-            if (indices.x == -1) break;
+    // Decide which device to send to with scatter axis
+    int dst_dev_idx = reinterpret_cast<int *>(&indices)[SCATTER_AXIS] / scatter_blocks_per_dev;
 
-            if (lane_id == stage) {
-                wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                update_phasebit<1>(phasebits, stage);
-    
-                tma::expect_bytes(inputs_arrived[stage], sizeof(globals::tile));
-                asm volatile("{cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 [%0], [%1, {%2, %3, %4, %5}], [%6];}"
-                    :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&tiles[stage][0]))), 
-                       "l"(G.src[G.dev_idx].template get_tma<globals::tile, 2>()), 
-                       "r"(indices.w * globals::COL_BLOCK_SIZE), "r"(indices.z * globals::ROW_BLOCK_SIZE), "r"(indices.y), "r"(indices.x),
-                       "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&inputs_arrived[stage])))
-                    : "memory");
-            }
+    // Decide which location in the scatter axis to send to with destination device index
+    int scatter_axis_base = scatter_blocks_per_dev * dst_dev_idx; // will be subtracted
 
-            stage = (stage + 1) % globals::PIPELINE_STAGES;
-        }
-    } else if (warp_id == 1 && lane_id < globals::PIPELINE_STAGES) {
-        // Scatter/gather configuration
-        // TODO: branch based on actual axis
-        const int scatter_blocks_per_dev = G.src.rows() / globals::ROW_BLOCK_SIZE / globals::NUM_DEVICES;
-        const int gather_blocks_per_dev = G.dst.depth() / globals::NUM_DEVICES; // important to use dst not src
+    // Decide which location in the gather axis to send to with current device index
+    int gather_axis_base = gather_blocks_per_dev * G.dev_idx; // will be added
 
-        for (int task_id = blockIdx.x; true; task_id += gridDim.x) {
-            int4 indices = get_indices(G, task_id);
-            if (indices.x == -1) break;
+    // Wait for inputs to be arrived
+    wait(inputs_arrived, 0);
+    asm volatile("{fence.proxy.async.shared::cta;}" ::: "memory"); // make writes to smem visible
 
-            // Decide which device to send to with scatter axis
-            int dst_dev_idx = reinterpret_cast<int *>(&indices)[SCATTER_AXIS] / scatter_blocks_per_dev;
-
-            // Decide which location in the scatter axis to send to with destination device index
-            int scatter_axis_base = scatter_blocks_per_dev * dst_dev_idx; // will be subtracted
-
-            // Decide which location in the gather axis to send to with current device index
-            int gather_axis_base = gather_blocks_per_dev * G.dev_idx; // will be added
-
-            if (lane_id == stage) {
-                wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
-                update_phasebit<0>(phasebits, stage);
-
-                asm volatile("{fence.proxy.async.shared::cta;}" ::: "memory"); // make writes to smem visible
-                asm volatile("{cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3, %4}], [%5];}"
-                    :: "l"(G.dst[dst_dev_idx].template get_tma<globals::tile, 2>()),
-                       "r"(indices.w * globals::COL_BLOCK_SIZE), "r"((indices.z - scatter_axis_base) * globals::ROW_BLOCK_SIZE), "r"(indices.y + gather_axis_base), "r"(indices.x), // TODO
-                       "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&tiles[stage][0])))
-                    : "memory");
-                asm volatile("{cp.async.bulk.commit_group;}");
-                asm volatile("{cp.async.bulk.wait_group.read %0;}" :: "n"(0) : "memory");
-
-                arrive(inputs_finished[stage]);
-            }
-
-            stage = (stage + 1) % globals::PIPELINE_STAGES;
-        }
-    }
+    // Store data to destination device
+    asm volatile("{cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3, %4}], [%5];}"
+        :: "l"(G.dst[dst_dev_idx].template get_tma<globals::tile, 2>()),
+            "r"(indices.w * globals::COL_BLOCK_SIZE), "r"((indices.z - scatter_axis_base) * globals::ROW_BLOCK_SIZE), "r"(indices.y + gather_axis_base), "r"(indices.x), // TODO
+            "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&tile[0])))
+        : "memory");
 }
 
 void entrypoint(
