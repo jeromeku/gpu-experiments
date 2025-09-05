@@ -31,8 +31,6 @@ NUM_ITERS = 10
 Q = torch.randn(B, N, H, D_qk, dtype=torch.bfloat16, device="cuda")
 K = torch.randn(B, N, H, D_qk, dtype=torch.bfloat16, device="cuda")
 V = torch.randn(B, N, H, D_vo, dtype=torch.bfloat16, device="cuda")
-O = torch.empty(B, N, H, D_vo, dtype=torch.bfloat16, device="cuda")
-L = torch.empty(B, H, N, dtype=torch.float32, device="cuda")
 softmax_scale = 1 / (D_qk ** 0.5)
 
 
@@ -53,7 +51,21 @@ def flash_attn_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.T
 
 
 compile_funcs = {}
-def flash_attn_fwd_raw(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+def flash_attn_fwd_raw(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    softmax_scale: float,
+    O: torch.Tensor | None = None,
+    L: torch.Tensor | None = None
+) -> torch.Tensor:
+    B, N, H, D_qk = Q.shape
+    _, _, _, D_vo = V.shape
+
+    if O is None:
+        O = torch.empty(B, N, H, D_vo, dtype=Q.dtype, device=Q.device)
+    if L is None:
+        L = torch.empty(B, H, N, dtype=torch.float32, device=Q.device)
 
     Q_cute = from_dlpack(Q.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=Q.ndim - 1)
     K_cute = from_dlpack(K.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=K.ndim - 1)
@@ -103,7 +115,7 @@ if CHECK_CORRECTNESS:
     O_flash = flash_attn_fwd(Q, K, V)
 
     # Raw Flash MHA
-    O_flash_raw, L_flash_raw = flash_attn_fwd_raw(Q, K, V)
+    O_flash_raw, L_flash_raw = flash_attn_fwd_raw(Q, K, V, softmax_scale)
 
     # Pytorch MHA
     O_ref = pytorch_attn_fwd(Q, K, V)
@@ -141,7 +153,7 @@ if BENCHMARK:
     print(f'TFLOPS: {tflops / avg_time:.2f} TFLOP/s')
 
     for i in range(NUM_WARMUPS):
-        flash_attn_fwd_raw(Q, K, V)
+        flash_attn_fwd_raw(Q, K, V, softmax_scale)
     torch.cuda.synchronize()
 
     times = []
@@ -149,7 +161,7 @@ if BENCHMARK:
     for i in range(NUM_ITERS):
         l2_cache.random_()
         start_event.record()
-        flash_attn_fwd_raw(Q, K, V)
+        flash_attn_fwd_raw(Q, K, V, softmax_scale)
         end_event.record()
         torch.cuda.synchronize()
         times.append(start_event.elapsed_time(end_event) * 1e-3)
