@@ -39,7 +39,6 @@ struct globals {
     static constexpr int NUM_DEVICES = 8;
     static constexpr int ROW_BLOCK_SIZE = 16;
     static constexpr int COL_BLOCK_SIZE = 128;
-    // static constexpr int PIPELINE_STAGES = 16;
 
     using tile = st_bf<ROW_BLOCK_SIZE, COL_BLOCK_SIZE>;
     using parallel_layout = pgl<gl<bf16, -1, -1, -1, -1, tma::descriptor<tile, 2, false>>, NUM_DEVICES, false>;
@@ -78,6 +77,9 @@ __device__ inline int4 get_indices(const globals &G, int task_id) {
 
 template <int SCATTER_AXIS = 2, int GATHER_AXIS = 1>
 __device__ inline void kernel(const globals &G) {
+    static_assert(SCATTER_AXIS < 4 && GATHER_AXIS < 4, "Scatter and gather axes must be between 0 and 3");
+    static_assert(SCATTER_AXIS != GATHER_AXIS, "Scatter and gather axes must be different");
+
     // Allocate shared memory
     extern __shared__ int __shm[];
     tma_swizzle_allocator allocator((int*)&__shm[0]);
@@ -99,18 +101,38 @@ __device__ inline void kernel(const globals &G) {
             "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&inputs_arrived)))
         : "memory");
 
-    // Calculate scatter and gather blocks per device
-    const int scatter_blocks_per_dev = G.src.rows() / globals::ROW_BLOCK_SIZE / globals::NUM_DEVICES;
-    const int gather_blocks_per_dev = G.dst.depth() / globals::NUM_DEVICES; // important to use dst not src
-
-    // Decide which device to send to with scatter axis
-    int dst_dev_idx = reinterpret_cast<int *>(&indices)[SCATTER_AXIS] / scatter_blocks_per_dev;
-
-    // Decide which location in the scatter axis to send to with destination device index
-    int scatter_axis_base = scatter_blocks_per_dev * dst_dev_idx; // will be subtracted
-
-    // Decide which location in the gather axis to send to with current device index
-    int gather_axis_base = gather_blocks_per_dev * G.dev_idx; // will be added
+    // Calculate the destination indices
+    int dst_dev_idx;
+    if constexpr (SCATTER_AXIS == 0) {
+        int scatter_blocks_per_dev = G.src.batch() / globals::NUM_DEVICES;
+        dst_dev_idx = indices.x / scatter_blocks_per_dev;
+        indices.x -= scatter_blocks_per_dev * dst_dev_idx;
+    } else if constexpr (SCATTER_AXIS == 1) {
+        int scatter_blocks_per_dev = G.src.depth() / globals::NUM_DEVICES;
+        dst_dev_idx = indices.y / scatter_blocks_per_dev;
+        indices.y -= scatter_blocks_per_dev * dst_dev_idx;
+    } else if constexpr (SCATTER_AXIS == 2) {
+        int scatter_blocks_per_dev = G.src.rows() / globals::ROW_BLOCK_SIZE / globals::NUM_DEVICES;
+        dst_dev_idx = indices.z / scatter_blocks_per_dev;
+        indices.z -= scatter_blocks_per_dev * dst_dev_idx;
+    } else {
+        int scatter_blocks_per_dev = G.src.cols() / globals::COL_BLOCK_SIZE / globals::NUM_DEVICES;
+        dst_dev_idx = indices.w / scatter_blocks_per_dev;
+        indices.w -= scatter_blocks_per_dev * dst_dev_idx;
+    }
+    if constexpr (GATHER_AXIS == 0) {
+        int gather_blocks_per_dev = G.dst.batch() / globals::NUM_DEVICES;
+        indices.x += gather_blocks_per_dev * G.dev_idx;
+    } else if constexpr (GATHER_AXIS == 1) {
+        int gather_blocks_per_dev = G.dst.depth() / globals::NUM_DEVICES;
+        indices.y += gather_blocks_per_dev * G.dev_idx;
+    } else if constexpr (GATHER_AXIS == 2) {
+        int gather_blocks_per_dev = G.dst.rows() / globals::ROW_BLOCK_SIZE / globals::NUM_DEVICES;
+        indices.z += gather_blocks_per_dev * G.dev_idx;
+    } else {
+        int gather_blocks_per_dev = G.dst.cols() / globals::COL_BLOCK_SIZE / globals::NUM_DEVICES;
+        indices.w += gather_blocks_per_dev * G.dev_idx;
+    }
 
     // Wait for inputs to be arrived
     wait(inputs_arrived, 0);
@@ -119,11 +141,12 @@ __device__ inline void kernel(const globals &G) {
     // Store data to destination device
     asm volatile("{cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group [%0, {%1, %2, %3, %4}], [%5];}"
         :: "l"(G.dst[dst_dev_idx].template get_tma<globals::tile, 2>()),
-            "r"(indices.w * globals::COL_BLOCK_SIZE), "r"((indices.z - scatter_axis_base) * globals::ROW_BLOCK_SIZE), "r"(indices.y + gather_axis_base), "r"(indices.x), // TODO
+            "r"(indices.w * globals::COL_BLOCK_SIZE), "r"(indices.z * globals::ROW_BLOCK_SIZE), "r"(indices.y), "r"(indices.x),
             "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&tile[0])))
         : "memory");
 }
 
+template <int SCATTER_AXIS = 2, int GATHER_AXIS = 1>
 void entrypoint(
     const at::Tensor &dst,
     const KittensIPCPointerSet &dst_ipc_ptrs,
@@ -131,7 +154,41 @@ void entrypoint(
     const KittensIPCPointerSet &src_ipc_ptrs,
     KittensBroker &broker
 ) {
+    static_assert(SCATTER_AXIS < 4 && GATHER_AXIS < 4, "Scatter and gather axes must be between 0 and 3");
+    static_assert(SCATTER_AXIS != GATHER_AXIS, "Scatter and gather axes must be different");
+
     kittens::py::device_check(dst, src);
+
+    int actual_scatter_axis = (4 - src.dim()) + SCATTER_AXIS;
+    int actual_gather_axis = (4 - src.dim()) + GATHER_AXIS;
+    TORCH_CHECK(actual_gather_axis >= 0, "actual_gather_axis is less than 0");
+    TORCH_CHECK(actual_scatter_axis >= 0, "actual_scatter_axis is less than 0");
+    
+    TORCH_CHECK(src.dim() == dst.dim(), "src and dst must have the same number of dimensions");
+
+    for (int i = 0; i < src.dim(); ++i) {
+        if (i == actual_scatter_axis) {
+            if constexpr (SCATTER_AXIS < 2) {
+                TORCH_CHECK(src.size(i) % broker.local_world_size_ == 0, "src must be divisible by the local world size for the scatter axis");
+            } else if constexpr (SCATTER_AXIS == 2) {
+                TORCH_CHECK(src.size(i) % (broker.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "src must be divisible by the local world size for the scatter axis");
+            } else if constexpr (SCATTER_AXIS == 3) {
+                TORCH_CHECK(src.size(i) % (broker.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "src must be divisible by the local world size for the scatter axis");
+            }
+            TORCH_CHECK(src.size(i) / broker.local_world_size_ == dst.size(i), "dst scatter dimension must be src scatter dimension divided by the local world size");
+        } else if (i == actual_gather_axis) {
+            if constexpr (GATHER_AXIS < 2) {
+                TORCH_CHECK(dst.size(i) % broker.local_world_size_ == 0, "dst must be divisible by the local world size for the gather axis");
+            } else if constexpr (GATHER_AXIS == 2) {
+                TORCH_CHECK(dst.size(i) % (broker.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "dst must be divisible by the local world size for the gather axis");
+            } else if constexpr (GATHER_AXIS == 3) {
+                TORCH_CHECK(dst.size(i) % (broker.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "dst must be divisible by the local world size for the gather axis");
+            }
+            TORCH_CHECK(dst.size(i) / broker.local_world_size_ == src.size(i), "src gather dimension must be dst gather dimension divided by the local world size");
+        } else {
+            TORCH_CHECK(src.size(i) == dst.size(i), "src and dst must have the same size for all dimensions except the scatter and gather axes");
+        }
+    }
 
     // Instantiate globals
     globals G {
@@ -153,5 +210,6 @@ PYBIND11_MODULE(_C, m) {
             pybind11::return_value_policy::move);
     pybind11::class_<KittensIPCPointerSet>(m, "KittensIPCPointerSet")
         .def(pybind11::init<>());
-    m.def("all2all", &entrypoint);
+    m.def("all2all_s2g1", &entrypoint<2, 1>);
+    m.def("all2all_s1g2", &entrypoint<1, 2>);
 }

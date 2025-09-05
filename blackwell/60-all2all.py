@@ -9,7 +9,7 @@ import torch
 import torch.distributed
 torch.set_printoptions(sci_mode=False)
 
-from _C import KittensBroker, all2all
+from _C import KittensBroker, all2all_s2g1 as all2all
 
 
 def check_diff(name, A, A_ref):
