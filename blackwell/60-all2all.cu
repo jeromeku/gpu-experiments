@@ -19,6 +19,7 @@
 
     Conclusion:
         - It always seems to be the case that for memory-bound workloads, non-persistent-grid is faster.
+        - 16x128 vs 128x128 only gives slight degradation (about 10 GB/s). As long as you have enough SM occupancy, you are good.
 */
 
 #include <torch/csrc/utils/pybind.h>
@@ -171,18 +172,18 @@ void entrypoint(
             if constexpr (SCATTER_AXIS < 2) {
                 TORCH_CHECK(src.size(i) % broker.local_world_size_ == 0, "src must be divisible by the local world size for the scatter axis");
             } else if constexpr (SCATTER_AXIS == 2) {
-                TORCH_CHECK(src.size(i) % (broker.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "src must be divisible by the local world size for the scatter axis");
+                TORCH_CHECK(src.size(i) % (broker.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "src must be divisible by the local world size times row block size for the scatter axis");
             } else if constexpr (SCATTER_AXIS == 3) {
-                TORCH_CHECK(src.size(i) % (broker.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "src must be divisible by the local world size for the scatter axis");
+                TORCH_CHECK(src.size(i) % (broker.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "src must be divisible by the local world size times col block size for the scatter axis");
             }
             TORCH_CHECK(src.size(i) / broker.local_world_size_ == dst.size(i), "dst scatter dimension must be src scatter dimension divided by the local world size");
         } else if (i == actual_gather_axis) {
             if constexpr (GATHER_AXIS < 2) {
                 TORCH_CHECK(dst.size(i) % broker.local_world_size_ == 0, "dst must be divisible by the local world size for the gather axis");
             } else if constexpr (GATHER_AXIS == 2) {
-                TORCH_CHECK(dst.size(i) % (broker.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "dst must be divisible by the local world size for the gather axis");
+                TORCH_CHECK(dst.size(i) % (broker.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "dst must be divisible by the local world size times row block size for the gather axis");
             } else if constexpr (GATHER_AXIS == 3) {
-                TORCH_CHECK(dst.size(i) % (broker.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "dst must be divisible by the local world size for the gather axis");
+                TORCH_CHECK(dst.size(i) % (broker.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "dst must be divisible by the local world size times col block size for the gather axis");
             }
             TORCH_CHECK(dst.size(i) / broker.local_world_size_ == src.size(i), "src gather dimension must be dst gather dimension divided by the local world size");
         } else {
