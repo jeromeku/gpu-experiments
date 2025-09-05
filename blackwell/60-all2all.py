@@ -12,6 +12,13 @@ torch.set_printoptions(sci_mode=False)
 from _C import KittensBroker, all2all_s2g1 as all2all
 
 
+# Flags
+CHECK_CORRECTNESS = True
+BENCHMARK = True
+PROFILE = True
+BENCHMARK_USP = False
+
+
 def check_diff(name, A, A_ref):
     print(f"\n{name}")
     print(f"Max diff:  {((A - A_ref).abs().max().item()):.10f}")
@@ -95,102 +102,121 @@ torch.distributed.init_process_group(
     world_size=world_size,
     timeout=timedelta(seconds=30),
 )
+torch.random.manual_seed(rank + 42)
+
+# Initialize KittensBroker
+broker = KittensBroker(local_rank, local_world_size)
 
 # Print global parameters
 if rank == 0:
     print(f"N: {N}, H: {H}, D: {D}")
 
-# Generate inputs
-torch.random.manual_seed(rank + 42)
-src = torch.randn(1, N // world_size, H, D, dtype=torch.bfloat16, device=device)
-dst = torch.zeros(1, N, H // world_size, D, dtype=torch.bfloat16, device=device)
+if CHECK_CORRECTNESS:
+    # Generate inputs
+    src = torch.randn(1, N // world_size, H, D, dtype=torch.bfloat16, device=device)
+    dst = torch.zeros(1, N, H // world_size, D, dtype=torch.bfloat16, device=device)
 
-# Initialize KittensBroker and KittensBond
-broker = KittensBroker(local_rank, local_world_size)
-src_ipc_ptrs = broker.gather_ipc_ptrs(src)
-dst_ipc_ptrs = broker.gather_ipc_ptrs(dst)
+    # Initialize KittensIPC pointers
+    src_ipc_ptrs = broker.gather_ipc_ptrs(src)
+    dst_ipc_ptrs = broker.gather_ipc_ptrs(dst)
 
-# Run PyTorch reference
-dst_ref = all2all_ref(src, scatter_idx=2, gather_idx=1)
-torch.distributed.barrier()
-torch.cuda.synchronize()
-
-# Run kernel
-all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
-torch.distributed.barrier()
-torch.cuda.synchronize()
-
-# Check correctness
-for i in range(world_size):
-    if i == rank:
-        check_diff(f"Rank {rank}", dst, dst_ref)
+    # Run PyTorch reference
+    dst_ref = all2all_ref(src, scatter_idx=2, gather_idx=1)
     torch.distributed.barrier()
+    torch.cuda.synchronize()
 
-# Benchmark
-NUM_WARMUPS = 5
-NUM_ITERS = 10
-
-chunk_size = (N // world_size) * (H // world_size) * D * 2 # chunk sent from one rank to another
-per_rank_comm_size = chunk_size * (world_size - 1)
-total_comm_size = per_rank_comm_size * world_size # N * (N - 1) * chunk_size
-
-start_event = torch.cuda.Event(enable_timing=True)
-end_event = torch.cuda.Event(enable_timing=True)
-
-for i in range(NUM_WARMUPS):
-    all2all_ref(src, scatter_idx=2, gather_idx=1)
-torch.distributed.barrier()
-torch.cuda.synchronize()
-
-start_event.record()
-for i in range(NUM_ITERS):
-    all2all_ref(src, scatter_idx=2, gather_idx=1)
-end_event.record()
-torch.distributed.barrier()
-torch.cuda.synchronize()
-
-total_time = start_event.elapsed_time(end_event) * 1e-3
-avg_time = total_time / NUM_ITERS
-
-if rank == 0:
-    print("\nB200 Max Unidirectional NVL Bandwidth: 900 GB/s")
-    print(f"Per-rank data sent: {per_rank_comm_size * 1e-9:.2f} GB")
-
-for i in range(world_size):
-    if i == rank:
-        print(f'Time taken: {avg_time * 1e6:.2f} us')
-        print(f'Unidirectional Bandwidth, USP: {per_rank_comm_size * 1e-9 / avg_time:.2f} GB/s')
-    torch.distributed.barrier()
-
-for i in range(NUM_WARMUPS):
+    # Run kernel
     all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
-torch.distributed.barrier()
-torch.cuda.synchronize()
-
-start_event.record()
-for i in range(NUM_ITERS):
-    all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
-end_event.record()
-torch.distributed.barrier()
-torch.cuda.synchronize()
-
-total_time = start_event.elapsed_time(end_event) * 1e-3
-avg_time = total_time / NUM_ITERS
-
-if rank == 0:
-    print("\nB200 Max Unidirectional NVL Bandwidth: 900 GB/s")
-    print(f"Per-rank data sent: {per_rank_comm_size * 1e-9:.2f} GB")
-
-for i in range(world_size):
-    if i == rank:
-        print(f'Time taken: {avg_time * 1e6:.2f} us')
-        print(f'Unidirectional Bandwidth, USP: {per_rank_comm_size * 1e-9 / avg_time:.2f} GB/s')
     torch.distributed.barrier()
-torch.cuda.synchronize()
+    torch.cuda.synchronize()
+
+    # Check correctness
+    for i in range(world_size):
+        if i == rank:
+            check_diff(f"Rank {rank}", dst, dst_ref)
+        torch.distributed.barrier()
+
+if BENCHMARK:
+    # Generate inputs
+    src = torch.randn(1, N // world_size, H, D, dtype=torch.bfloat16, device=device)
+    dst = torch.zeros(1, N, H // world_size, D, dtype=torch.bfloat16, device=device)
+
+    # Initialize KittensIPC pointers
+    src_ipc_ptrs = broker.gather_ipc_ptrs(src)
+    dst_ipc_ptrs = broker.gather_ipc_ptrs(dst)
+
+    # Benchmark
+    NUM_WARMUPS = 5
+    NUM_ITERS = 10
+
+    chunk_size = (N // world_size) * (H // world_size) * D * 2 # chunk sent from one rank to another
+    per_rank_comm_size = chunk_size * (world_size - 1)
+    total_comm_size = per_rank_comm_size * world_size # N * (N - 1) * chunk_size
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    for i in range(NUM_WARMUPS):
+        all2all_ref(src, scatter_idx=2, gather_idx=1)
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+    start_event.record()
+    for i in range(NUM_ITERS):
+        all2all_ref(src, scatter_idx=2, gather_idx=1)
+    end_event.record()
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+    total_time = start_event.elapsed_time(end_event) * 1e-3
+    avg_time = total_time / NUM_ITERS
+
+    if rank == 0:
+        print("\nB200 Max Unidirectional NVL Bandwidth: 900 GB/s")
+        print(f"Per-rank data sent: {per_rank_comm_size * 1e-9:.2f} GB")
+
+    for i in range(world_size):
+        if i == rank:
+            print(f'Time taken: {avg_time * 1e6:.2f} us')
+            print(f'Unidirectional Bandwidth, USP: {per_rank_comm_size * 1e-9 / avg_time:.2f} GB/s')
+        torch.distributed.barrier()
+
+    for i in range(NUM_WARMUPS):
+        all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+    start_event.record()
+    for i in range(NUM_ITERS):
+        all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
+    end_event.record()
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+    total_time = start_event.elapsed_time(end_event) * 1e-3
+    avg_time = total_time / NUM_ITERS
+
+    if rank == 0:
+        print("\nB200 Max Unidirectional NVL Bandwidth: 900 GB/s")
+        print(f"Per-rank data sent: {per_rank_comm_size * 1e-9:.2f} GB")
+
+    for i in range(world_size):
+        if i == rank:
+            print(f'Time taken: {avg_time * 1e6:.2f} us')
+            print(f'Unidirectional Bandwidth, USP: {per_rank_comm_size * 1e-9 / avg_time:.2f} GB/s')
+        torch.distributed.barrier()
+    torch.cuda.synchronize()
 
 # Profile
-profile_enabled = False
-if profile_enabled:
+if PROFILE:
+    # Generate inputs
+    src = torch.randn(1, N // world_size, H, D, dtype=torch.bfloat16, device=device)
+    dst = torch.zeros(1, N, H // world_size, D, dtype=torch.bfloat16, device=device)
+
+    # Initialize KittensIPC pointers
+    src_ipc_ptrs = broker.gather_ipc_ptrs(src)
+    dst_ipc_ptrs = broker.gather_ipc_ptrs(dst)
+
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         record_shapes=True,
