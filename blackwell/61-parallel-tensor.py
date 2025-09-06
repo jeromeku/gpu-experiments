@@ -2,11 +2,15 @@ import torch
 
 from _C import create_custom_tensor
 
-A = create_custom_tensor([32, 32], torch.bfloat16, 0)
-B = create_custom_tensor([32, 32], torch.bfloat16, 0)
+A = create_custom_tensor([1024, 1024], torch.bfloat16, 0)
+torch.cuda.synchronize()
+B = create_custom_tensor([1024, 1024], torch.bfloat16, 0)
+torch.cuda.synchronize()
 
 print(A)
+torch.cuda.synchronize()
 print(B)
+torch.cuda.synchronize()
 
 print(A.device)
 print(B.device)

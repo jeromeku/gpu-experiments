@@ -55,7 +55,8 @@
 # SRC := 57-tcgen05-bf16-mma-smallM.cu
 # SRC := 58-tensor-ipc.cu
 # SRC := 59-tensor-ipc-polished.cu
-SRC := 60-all2all.cu
+# SRC := 60-all2all.cu
+SRC := 61-parallel-tensor.cu
 
 # Binaries
 NVCC := nvcc
@@ -108,16 +109,16 @@ NVCCFLAGS += -diag-suppress 3189
 # RUN_CMD := python3 $(basename $(SRC)).py
 
 # 3. PyTorch binding configuration
-# NVCCFLAGS += -shared -fPIC
-# NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
-# OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-# RUN_CMD := python3 $(basename $(SRC)).py
-
-# 4. PyTorch + Torchrun binding configuration
 NVCCFLAGS += -shared -fPIC
 NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
 OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-RUN_CMD := torchrun --nproc_per_node=8 $(basename $(SRC)).py
+RUN_CMD := python3 $(basename $(SRC)).py
+
+# 4. PyTorch + Torchrun binding configuration
+# NVCCFLAGS += -shared -fPIC
+# NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
+# OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+# RUN_CMD := torchrun --nproc_per_node=8 $(basename $(SRC)).py
 
 # 5. MPI configuration
 # NVCCFLAGS += -ccbin ${MPICC}
