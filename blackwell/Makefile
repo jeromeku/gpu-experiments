@@ -57,7 +57,8 @@
 # SRC := 59-tensor-ipc-polished.cu
 # SRC := 60-all2all.cu
 # SRC := 61-vmm-ipc.cu
-SRC := 62-vmm-ipc-polished.cu
+# SRC := 62-vmm-ipc-polished.cu
+SRC := 63-parallel-tensor.cu
 
 # Binaries
 NVCC := nvcc
