@@ -22,8 +22,6 @@
         - 16x128 vs 128x128 only gives slight degradation (about 10 GB/s). As long as you have enough SM occupancy, you are good.
 */
 
-#include <torch/csrc/utils/pybind.h>
-
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "pyutils/torchutils.cuh"
@@ -195,6 +193,8 @@ void entrypoint(kittens::py::TKParallelTensor &dst, kittens::py::TKParallelTenso
     // Run kernel
     kittens::py::launch_kernel<config, globals, kernel<2, 1>>(G);
 }
+
+#include <torch/csrc/utils/pybind.h>
 
 PYBIND11_MODULE(_C, m) {
     BIND_TK_PARALLEL_TENSOR(m);
