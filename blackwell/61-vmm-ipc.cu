@@ -395,7 +395,6 @@ void vmm_ipc(int local_rank, int local_world_size) {
             int fd = kittens::detail::broker::recv_fd(sock);
             void *other_raw_ptr;
             kittens::detail::ipc::import_handle(&other_raw_ptr, *reinterpret_cast<ipc_handle_t*>(&fd), allocated_size);
-            kittens::detail::vmm::vm_set_access(other_raw_ptr, allocated_size, local_world_size);
             all_raw_ptrs.push_back(other_raw_ptr);
         }
         CUDACHECK(cudaSetDevice(0));
