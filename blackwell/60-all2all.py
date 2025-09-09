@@ -9,14 +9,13 @@ import torch
 import torch.distributed
 torch.set_printoptions(sci_mode=False)
 
-from _C import KittensBroker, all2all_s2g1 as all2all
+from _C import TKParallelTensor, all2all_s2g1 as all2all
 
 
 # Flags
 CHECK_CORRECTNESS = True
 BENCHMARK = True
 PROFILE = True
-BENCHMARK_USP = False
 
 
 def check_diff(name, A, A_ref):
@@ -104,46 +103,43 @@ torch.distributed.init_process_group(
 )
 torch.random.manual_seed(rank + 42)
 
-# Initialize KittensBroker
-broker = KittensBroker(local_rank, local_world_size)
-
 # Print global parameters
 if rank == 0:
     print(f"N: {N}, H: {H}, D: {D}")
 
 if CHECK_CORRECTNESS:
-    # Generate inputs
-    src = torch.randn(1, N // world_size, H, D, dtype=torch.bfloat16, device=device)
-    dst = torch.zeros(1, N, H // world_size, D, dtype=torch.bfloat16, device=device)
+    # Allocate tensors
+    src = TKParallelTensor((1, N // world_size, H, D), dtype=torch.bfloat16, local_rank=local_rank, local_world_size=local_world_size, multicast=False)
+    dst = TKParallelTensor((1, N, H // world_size, D), dtype=torch.bfloat16, local_rank=local_rank, local_world_size=local_world_size, multicast=False)
 
-    # Initialize KittensIPC pointers
-    src_ipc_ptrs = broker.gather_ipc_ptrs(src)
-    dst_ipc_ptrs = broker.gather_ipc_ptrs(dst)
+    # Generate inputs
+    torch.randn((1, N // world_size, H, D), out=src.data_)
+    torch.zeros((1, N, H // world_size, D), out=dst.data_)
 
     # Run PyTorch reference
-    dst_ref = all2all_ref(src, scatter_idx=2, gather_idx=1)
+    dst_ref = all2all_ref(src.data_, scatter_idx=2, gather_idx=1)
     torch.distributed.barrier()
     torch.cuda.synchronize()
 
     # Run kernel
-    all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
+    all2all(dst, src)
     torch.distributed.barrier()
     torch.cuda.synchronize()
 
     # Check correctness
     for i in range(world_size):
         if i == rank:
-            check_diff(f"Rank {rank}", dst, dst_ref)
+            check_diff(f"Rank {rank}", dst.data_, dst_ref)
         torch.distributed.barrier()
 
 if BENCHMARK:
-    # Generate inputs
-    src = torch.randn(1, N // world_size, H, D, dtype=torch.bfloat16, device=device)
-    dst = torch.zeros(1, N, H // world_size, D, dtype=torch.bfloat16, device=device)
+    # Allocate tensors
+    src = TKParallelTensor((1, N // world_size, H, D), dtype=torch.bfloat16, local_rank=local_rank, local_world_size=local_world_size, multicast=False)
+    dst = TKParallelTensor((1, N, H // world_size, D), dtype=torch.bfloat16, local_rank=local_rank, local_world_size=local_world_size, multicast=False)
 
-    # Initialize KittensIPC pointers
-    src_ipc_ptrs = broker.gather_ipc_ptrs(src)
-    dst_ipc_ptrs = broker.gather_ipc_ptrs(dst)
+    # Generate inputs
+    torch.randn((1, N // world_size, H, D), out=src.data_)
+    torch.zeros((1, N, H // world_size, D), out=dst.data_)
 
     # Benchmark
     NUM_WARMUPS = 5
@@ -157,13 +153,13 @@ if BENCHMARK:
     end_event = torch.cuda.Event(enable_timing=True)
 
     for i in range(NUM_WARMUPS):
-        all2all_ref(src, scatter_idx=2, gather_idx=1)
+        all2all_ref(src.data_, scatter_idx=2, gather_idx=1)
     torch.distributed.barrier()
     torch.cuda.synchronize()
 
     start_event.record()
     for i in range(NUM_ITERS):
-        all2all_ref(src, scatter_idx=2, gather_idx=1)
+        all2all_ref(src.data_, scatter_idx=2, gather_idx=1)
     end_event.record()
     torch.distributed.barrier()
     torch.cuda.synchronize()
@@ -182,13 +178,13 @@ if BENCHMARK:
         torch.distributed.barrier()
 
     for i in range(NUM_WARMUPS):
-        all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
+        all2all(dst, src)
     torch.distributed.barrier()
     torch.cuda.synchronize()
 
     start_event.record()
     for i in range(NUM_ITERS):
-        all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
+        all2all(dst, src)
     end_event.record()
     torch.distributed.barrier()
     torch.cuda.synchronize()
@@ -209,14 +205,6 @@ if BENCHMARK:
 
 # Profile
 if PROFILE:
-    # Generate inputs
-    src = torch.randn(1, N // world_size, H, D, dtype=torch.bfloat16, device=device)
-    dst = torch.zeros(1, N, H // world_size, D, dtype=torch.bfloat16, device=device)
-
-    # Initialize KittensIPC pointers
-    src_ipc_ptrs = broker.gather_ipc_ptrs(src)
-    dst_ipc_ptrs = broker.gather_ipc_ptrs(dst)
-
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         record_shapes=True,
@@ -224,8 +212,17 @@ if PROFILE:
         with_modules=True,
         with_stack=True
     ) as profiler:
+        # Allocate tensors
+        src = TKParallelTensor((1, N // world_size, H, D), dtype=torch.bfloat16, local_rank=local_rank, local_world_size=local_world_size, multicast=False)
+        dst = TKParallelTensor((1, N, H // world_size, D), dtype=torch.bfloat16, local_rank=local_rank, local_world_size=local_world_size, multicast=False)
+
+        # Generate inputs
+        torch.randn((1, N // world_size, H, D), out=src.data_)
+        torch.zeros((1, N, H // world_size, D), out=dst.data_)
+
+        # Profile
         for i in range(NUM_WARMUPS + NUM_ITERS):
-            all2all(dst, dst_ipc_ptrs, src, src_ipc_ptrs, broker)
+            all2all(dst, src)
 
     # Export to Chrome trace format
     profiler.export_chrome_trace(f"all2all_rank{rank}.json")

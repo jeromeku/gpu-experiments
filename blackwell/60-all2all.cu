@@ -148,54 +148,48 @@ __device__ inline void kernel(const globals &G) {
 }
 
 template <int SCATTER_AXIS = 2, int GATHER_AXIS = 1>
-void entrypoint(
-    const at::Tensor &dst,
-    const KittensIPCPointerSet &dst_ipc_ptrs,
-    const at::Tensor &src,
-    const KittensIPCPointerSet &src_ipc_ptrs,
-    KittensBroker &broker
-) {
+void entrypoint(kittens::py::TKParallelTensor &dst, kittens::py::TKParallelTensor &src) {
     static_assert(SCATTER_AXIS < 4 && GATHER_AXIS < 4, "Scatter and gather axes must be between 0 and 3");
     static_assert(SCATTER_AXIS != GATHER_AXIS, "Scatter and gather axes must be different");
 
-    kittens::py::device_check(dst, src);
+    kittens::py::parallel_tensor_check(dst, src);
 
-    int actual_scatter_axis = (4 - src.dim()) + SCATTER_AXIS;
-    int actual_gather_axis = (4 - src.dim()) + GATHER_AXIS;
+    int actual_scatter_axis = (4 - src.data_.dim()) + SCATTER_AXIS;
+    int actual_gather_axis = (4 - src.data_.dim()) + GATHER_AXIS;
     TORCH_CHECK(actual_gather_axis >= 0, "actual_gather_axis is less than 0");
     TORCH_CHECK(actual_scatter_axis >= 0, "actual_scatter_axis is less than 0");
-    
-    TORCH_CHECK(src.dim() == dst.dim(), "src and dst must have the same number of dimensions");
 
-    for (int i = 0; i < src.dim(); ++i) {
+    TORCH_CHECK(src.data_.dim() == dst.data_.dim(), "src and dst must have the same number of dimensions");
+
+    for (int i = 0; i < src.data_.dim(); ++i) {
         if (i == actual_scatter_axis) {
             if constexpr (SCATTER_AXIS < 2) {
-                TORCH_CHECK(src.size(i) % broker.local_world_size_ == 0, "src must be divisible by the local world size for the scatter axis");
+                TORCH_CHECK(src.data_.size(i) % src.local_world_size_ == 0, "src must be divisible by the local world size for the scatter axis");
             } else if constexpr (SCATTER_AXIS == 2) {
-                TORCH_CHECK(src.size(i) % (broker.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "src must be divisible by the local world size times row block size for the scatter axis");
+                TORCH_CHECK(src.data_.size(i) % (src.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "src must be divisible by the local world size times row block size for the scatter axis");
             } else if constexpr (SCATTER_AXIS == 3) {
-                TORCH_CHECK(src.size(i) % (broker.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "src must be divisible by the local world size times col block size for the scatter axis");
+                TORCH_CHECK(src.data_.size(i) % (src.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "src must be divisible by the local world size times col block size for the scatter axis");
             }
-            TORCH_CHECK(src.size(i) / broker.local_world_size_ == dst.size(i), "dst scatter dimension must be src scatter dimension divided by the local world size");
+            TORCH_CHECK(src.data_.size(i) / src.local_world_size_ == dst.data_.size(i), "dst scatter dimension must be src scatter dimension divided by the local world size");
         } else if (i == actual_gather_axis) {
             if constexpr (GATHER_AXIS < 2) {
-                TORCH_CHECK(dst.size(i) % broker.local_world_size_ == 0, "dst must be divisible by the local world size for the gather axis");
+                TORCH_CHECK(dst.data_.size(i) % dst.local_world_size_ == 0, "dst must be divisible by the local world size for the gather axis");
             } else if constexpr (GATHER_AXIS == 2) {
-                TORCH_CHECK(dst.size(i) % (broker.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "dst must be divisible by the local world size times row block size for the gather axis");
+                TORCH_CHECK(dst.data_.size(i) % (dst.local_world_size_ * globals::ROW_BLOCK_SIZE) == 0, "dst must be divisible by the local world size times row block size for the gather axis");
             } else if constexpr (GATHER_AXIS == 3) {
-                TORCH_CHECK(dst.size(i) % (broker.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "dst must be divisible by the local world size times col block size for the gather axis");
+                TORCH_CHECK(dst.data_.size(i) % (dst.local_world_size_ * globals::COL_BLOCK_SIZE) == 0, "dst must be divisible by the local world size times col block size for the gather axis");
             }
-            TORCH_CHECK(dst.size(i) / broker.local_world_size_ == src.size(i), "src gather dimension must be dst gather dimension divided by the local world size");
+            TORCH_CHECK(dst.data_.size(i) / dst.local_world_size_ == src.data_.size(i), "src gather dimension must be dst gather dimension divided by the local world size");
         } else {
-            TORCH_CHECK(src.size(i) == dst.size(i), "src and dst must have the same size for all dimensions except the scatter and gather axes");
+            TORCH_CHECK(src.data_.size(i) == dst.data_.size(i), "src and dst must have the same size for all dimensions except the scatter and gather axes");
         }
     }
 
     // Instantiate globals
     globals G {
-        .src = kittens::py::tensor_to_pgl<typename globals::parallel_layout>(src, src_ipc_ptrs, broker),
-        .dst = kittens::py::tensor_to_pgl<typename globals::parallel_layout>(dst, dst_ipc_ptrs, broker),
-        .dev_idx = broker.local_rank_
+        .src = kittens::py::parallel_tensor_to_pgl<typename globals::parallel_layout>(src),
+        .dst = kittens::py::parallel_tensor_to_pgl<typename globals::parallel_layout>(dst),
+        .dev_idx = src.local_rank_
     };
 
     // Run kernel
@@ -203,14 +197,7 @@ void entrypoint(
 }
 
 PYBIND11_MODULE(_C, m) {
-    pybind11::class_<KittensBroker>(m, "KittensBroker")
-        .def(pybind11::init<int,int>())
-        .def("gather_ipc_ptrs",
-            pybind11::overload_cast<const at::Tensor&>(&KittensBroker::gather_ipc_ptrs),
-            pybind11::call_guard<pybind11::gil_scoped_release>(),
-            pybind11::return_value_policy::move);
-    pybind11::class_<KittensIPCPointerSet>(m, "KittensIPCPointerSet")
-        .def(pybind11::init<>());
+    BIND_TK_PARALLEL_TENSOR(m);
     m.def("all2all_s2g1", &entrypoint<2, 1>);
     m.def("all2all_s1g2", &entrypoint<1, 2>);
 }
