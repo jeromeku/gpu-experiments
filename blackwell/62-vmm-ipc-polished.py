@@ -1,7 +1,3 @@
-"""
-torchrun --nproc_per_node=8 61-vmm-ipc.py
-"""
-
 from datetime import timedelta
 import os
 
