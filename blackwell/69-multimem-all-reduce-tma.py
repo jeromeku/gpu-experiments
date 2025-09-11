@@ -84,15 +84,22 @@ tensor_tk = TKParallelTensor(
     local_world_size=local_world_size, 
     multicast=True
 )
+barrier_tk = TKParallelTensor(
+    (1, 1),
+    dtype=torch.int,
+    local_rank=local_rank,
+    local_world_size=local_world_size,
+    multicast=True
+)
 torch.randn((N, N), out=tensor_tk.data_)
+barrier_tk.data_.zero_()
 tensor_nccl = tensor_tk.data_.clone()
 
 nccl_func = lambda: torch.distributed.all_reduce(tensor_nccl, op=torch.distributed.ReduceOp.SUM)
-tk_func = lambda: tk_all_reduce(tensor_tk)
+tk_func = lambda: tk_all_reduce(tensor_tk, barrier_tk)
 
 nccl_func()
 tk_func()
-torch.distributed.barrier() # TODO: remove this
 check_diff("AllReduceSum Diff Comparison", tensor_tk.data_, tensor_nccl)
 
 nccl_avg_ms = benchmark(nccl_func, NUM_WARMUP_ITERS, NUM_ITERS)
