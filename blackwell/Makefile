@@ -59,7 +59,8 @@
 # SRC := 61-vmm-ipc.cu
 # SRC := 62-vmm-ipc-polished.cu
 # SRC := 63-parallel-tensor.cu
-SRC := 64-multigpu-sync.cu
+# SRC := 64-multigpu-sync.cu
+SRC := 65-multimem-all-reduce.cu
 
 # Binaries
 NVCC := nvcc
@@ -121,7 +122,7 @@ NVCCFLAGS += -diag-suppress 3189
 NVCCFLAGS += -shared -fPIC
 NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
 OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-RUN_CMD := torchrun --nproc_per_node=8 $(basename $(SRC)).py
+RUN_CMD := OMP_NUM_THREADS=1 torchrun --nproc_per_node=8 $(basename $(SRC)).py
 
 # 5. MPI configuration
 # NVCCFLAGS += -ccbin ${MPICC}
