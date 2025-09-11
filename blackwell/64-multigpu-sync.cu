@@ -7,13 +7,8 @@ using namespace kittens::prototype;
 
 struct config {
     static constexpr int CLUSTER_SIZE = 1;
-    
-    static constexpr int NUM_BLOCKS = 148;
-
-    static constexpr int NUM_WARPGROUPS = 3;
-    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
-    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
-
+    static constexpr int NUM_BLOCKS = 1;
+    static constexpr int NUM_THREADS = 1;
     static constexpr int DYNAMIC_SHARED_MEMORY = 0;
 };
 
@@ -24,7 +19,7 @@ struct globals {
 };
 
 __device__ inline void kernel(const globals &G) {
-    device<globals::NUM_DEVICES>::sync(G.barriers, G.dev_idx);
+    device<globals::NUM_DEVICES>::sync_on_exit(G.barriers, G.dev_idx);
 }
 
 void entrypoint(kittens::py::TKParallelTensor &barriers) {

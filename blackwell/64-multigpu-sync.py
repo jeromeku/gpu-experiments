@@ -29,11 +29,12 @@ torch.distributed.init_process_group(
     timeout=timedelta(seconds=30),
 )
 
-# Allocate tensor
-barriers = TKParallelTensor((1,), dtype=torch.int, local_rank=local_rank, local_world_size=local_world_size, multicast=True)
+# Allocate the barrier tensor. Must be initialized to zero
+barriers = TKParallelTensor((1, 1), dtype=torch.int, local_rank=local_rank, local_world_size=local_world_size, multicast=True)
+barriers.data_.zero_()
 
 # Run our function
-if False:
+if True:
     print("Profiling...")
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -42,8 +43,8 @@ if False:
         with_modules=True,
         with_stack=True
     ) as profiler:
-        sleep(local_rank)
-        sync(barriers)
+        for i in range(10):
+            sync(barriers)
 
     # Export to Chrome trace format
     if rank == 0:
