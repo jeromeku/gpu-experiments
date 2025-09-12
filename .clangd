@@ -1,0 +1,33 @@
+CompileFlags:
+  Add:
+    # C++ standard
+    - -std=c++20
+
+    # CUDA flags
+    - -xcuda # treat all files as CUDA
+    - --cuda-path=/usr/local/cuda # should point to the default installation
+    - --cuda-gpu-arch=sm_100a # not sure if this works
+
+    # Include paths (fix to match your environment)
+    - -I/home/stuart/gpu-experiments/ThunderKittens/include
+    - -I/home/stuart/gpu-experiments/ThunderKittens/prototype
+    - -I/home/stuart/.local/share/uv/python/cpython-3.12.11-linux-x86_64-gnu/include/python3.12
+    - -I/home/stuart/anytitan/.venv/lib/python3.12/site-packages/torch/include
+    - -I/home/stuart/anytitan/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include
+    - -I/home/stuart/.local/share/uv/python/cpython-3.12.11-linux-x86_64-gnu/include/python3.12
+    - -I/home/stuart/anytitan/.venv/lib/python3.12/site-packages/pybind11/include
+
+    # Macros
+    - -DNDEBUG
+    - -DKITTENS_HOPPER
+    - -DKITTENS_BLACKWELL
+    - -D__CUDA_NO_HALF_OPERATORS__
+    - -D__CUDA_NO_HALF_CONVERSIONS__
+    - -D__CUDA_NO_BFLOAT16_CONVERSIONS__
+    - -D__CUDA_NO_HALF2_OPERATORS__
+    - -DTORCH_API_INCLUDE_EXTENSION_H
+
+    # Miscellaneous flags
+    - -Wno-psabi
+    - -fno-strict-aliasing
+    - -ftemplate-backtrace-limit=0
