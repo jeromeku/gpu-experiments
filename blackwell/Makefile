@@ -66,7 +66,8 @@
 # SRC := 69-multimem-all-reduce-tma.cu
 # SRC := 70-nvlink-bandwidth-copy-engine.cu
 # SRC := 71-nvlink-bandwidth-sm.cu
-SRC := 72-nvlink-bandwidth-sm-tma.cu
+# SRC := 72-nvlink-bandwidth-sm-tma.cu
+SRC := 73-atomic-check.cu
 
 # Binaries
 NVCC := nvcc
@@ -141,6 +142,9 @@ RUN_CMD := ./$(OUT)
 
 all: $(OUT)
 
+ptx: $(SRC)
+	$(NVCC) $(SRC) $(NVCCFLAGS) --ptx -o $(basename $(SRC)).ptx
+
 run: $(OUT)
 	$(RUN_CMD)
 
@@ -148,4 +152,4 @@ $(OUT): $(SRC)
 	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(OUT)
 
 clean:
-	rm -f $(OUT)
+	rm -f $(OUT) $(basename $(SRC)).ptx $(basename $(SRC)).out
