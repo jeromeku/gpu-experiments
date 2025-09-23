@@ -67,7 +67,8 @@
 # SRC := 70-nvlink-bandwidth-copy-engine.cu
 # SRC := 71-nvlink-bandwidth-sm.cu
 # SRC := 72-nvlink-bandwidth-sm-tma.cu
-SRC := 73-atomic-check.cu
+# SRC := 73-atomic-check.cu
+SRC := 74-faster-comms-sms.cu
 
 # Binaries
 NVCC := nvcc
@@ -109,8 +110,8 @@ NVCCFLAGS += -diag-suppress 3189
 # Choose one of the following configurations:
 
 # 1. Standalone configuration
-OUT := $(basename $(SRC)).out
-RUN_CMD := ./$(OUT)
+# OUT := $(basename $(SRC)).out
+# RUN_CMD := ./$(OUT)
 
 # 2. Python binding configuration
 # NVCCFLAGS += -shared -fPIC
@@ -128,12 +129,12 @@ RUN_CMD := ./$(OUT)
 # RUN_CMD := python3 $(basename $(SRC)).py
 
 # 4. PyTorch + Torchrun binding configuration
-# NVCCFLAGS += -shared -fPIC
-# NVCCFLAGS += ${PYTHON_LIBDIR} ${PYTORCH_LIBDIR} -lpython${PYTHON_VERSION}
-# NVCCFLAGS += -ltorch_python -ltorch_cuda -ltorch_cpu -ltorch -lc10_cuda -lc10
-# NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
-# OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-# RUN_CMD := OMP_NUM_THREADS=1 torchrun --nproc_per_node=8 $(basename $(SRC)).py
+NVCCFLAGS += -shared -fPIC
+NVCCFLAGS += ${PYTHON_LIBDIR} ${PYTORCH_LIBDIR} -lpython${PYTHON_VERSION}
+NVCCFLAGS += -ltorch_python -ltorch_cuda -ltorch_cpu -ltorch -lc10_cuda -lc10
+NVCCFLAGS += -DTORCH_EXTENSION_NAME=_C # replicate setup.py behavior
+OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+RUN_CMD := OMP_NUM_THREADS=1 torchrun --nproc_per_node=8 $(basename $(SRC)).py
 
 # 5. MPI configuration
 # NVCCFLAGS += -ccbin ${MPICC}
