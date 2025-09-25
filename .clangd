@@ -17,6 +17,7 @@ CompileFlags:
     - -I/home/stuart/.local/share/uv/python/cpython-3.12.11-linux-x86_64-gnu/include/python3.12
     - -I/home/stuart/anytitan/.venv/lib/python3.12/site-packages/pybind11/include
     - -I/usr/include/nvshmem_12/
+    - -I/usr/mpi/gcc/openmpi-4.1.7rc1/include
 
     # Macros
     - -DNDEBUG
