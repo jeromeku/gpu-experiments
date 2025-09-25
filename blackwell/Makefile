@@ -94,7 +94,7 @@ NVCCFLAGS := -DNDEBUG -lineinfo
 NVCCFLAGS += --expt-extended-lambda --expt-relaxed-constexpr 
 NVCCFLAGS += -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing 
 NVCCFLAGS += -forward-unknown-to-host-compiler -ftemplate-backtrace-limit=0
-NVCCFLAGS += -ccbin ${CC} -std=c++20 -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static
+NVCCFLAGS += -std=c++20 -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static
 NVCCFLAGS += -O3 --use_fast_math # VERY important to include this flag
 NVCCFLAGS += -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills 
 NVCCFLAGS += -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype
@@ -150,12 +150,12 @@ NVCCFLAGS+= -DKITTENS_HOPPER -DKITTENS_BLACKWELL -gencode arch=compute_100a,code
 # RUN_CMD := $(MPIRUN) -np 8 ./$(OUT)
 
 # 6. NVSHMEM configuration
+NVCCFLAGS += -ccbin ${MPICC}
 NVCCFLAGS += -rdc=true
-NVCCFLAGS += -I/usr/include/nvshmem_12/ -L/usr/lib/x86_64-linux-gnu/nvshmem/12 
-NVCCFLAGS += -lnvshmem_host -lnvshmem_device
+NVCCFLAGS += -I/usr/include/nvshmem_12/ -L/usr/lib/x86_64-linux-gnu/nvshmem/12 -lnvshmem_host -lnvshmem_device
 NVCCFLAGS += -diag-suppress 3013 -diag-suppress 3012
 OUT := $(basename $(SRC)).out
-RUN_CMD := /usr/bin/nvshmem_12/nvshmrun -n 8 -ppn 8 ./$(basename $(SRC)).out
+RUN_CMD := $(MPIRUN) -np 8 ./$(OUT)
 
 all: $(OUT)
 

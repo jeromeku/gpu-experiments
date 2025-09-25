@@ -79,9 +79,20 @@
                 - All writes are eventually complete & remains visible once visible in one API call (stable)
 */
 
+#include <mpi.h> // Crashes if not included first!
 #include <cuda.h>
 #include <nvshmem.h>
 #include <nvshmemx.h>
+
+// CUDA runtime API
+#define CUDACHECK(cmd) do {                                   \
+    cudaError_t err = cmd;                                    \
+    if (err != cudaSuccess) {                                 \
+        fprintf(stderr, "Failed: CUDA error %s:%d '%s'\n",    \
+            __FILE__, __LINE__, cudaGetErrorString(err));     \
+        exit(EXIT_FAILURE);                                   \
+    }                                                         \
+} while(0)
 
 __global__ void simple_shift(int *dst) {
     int my_pe = nvshmem_my_pe();
@@ -92,11 +103,22 @@ __global__ void simple_shift(int *dst) {
     nvshmem_int_p(dst, my_pe, peer);
 }
 
-int main() {
-    nvshmem_init();
-    
-    int my_pe_node = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
-    cudaSetDevice(my_pe_node);
+int main(int argc, char **argv) {
+    // Initialize MPI
+    int rank;
+    int world_size;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    // Initialize NVSHMEM
+    nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
+    MPI_Comm mpi_comm = MPI_COMM_WORLD;
+    attr.mpi_comm = &mpi_comm;
+    nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
+
+    int current_pe_node = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
+    CUDACHECK(cudaSetDevice(current_pe_node));
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
@@ -116,5 +138,35 @@ int main() {
     cudaStreamDestroy(stream);
 
     nvshmem_finalize();
+    MPI_Finalize();
     return 0;
 }
+
+// Below version assumes nvshmrun usage
+
+// int main() {
+//     nvshmem_init();
+    
+//     int my_pe_node = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
+//     cudaSetDevice(my_pe_node);
+
+//     cudaStream_t stream;
+//     cudaStreamCreate(&stream);
+
+//     int *dst = (int *)nvshmem_malloc(sizeof(int));
+
+//     simple_shift<<<1, 1, 0, stream>>>(dst);
+//     nvshmemx_barrier_all_on_stream(stream);
+
+//     int msg;
+//     cudaMemcpyAsync(&msg, dst, sizeof(int), cudaMemcpyDeviceToHost, stream);
+//     cudaStreamSynchronize(stream);
+
+//     printf("%d: received %d\n", nvshmem_my_pe(), msg);
+
+//     nvshmem_free(dst);
+//     cudaStreamDestroy(stream);
+
+//     nvshmem_finalize();
+//     return 0;
+// }
