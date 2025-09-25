@@ -69,7 +69,8 @@
 # SRC := 72-nvlink-bandwidth-sm-tma.cu
 # SRC := 73-atomic-check.cu
 # SRC := 74-faster-comms-sms.cu
-SRC := 75-nvshmem.cu
+# SRC := 75-nvshmem.cu
+SRC := 76-nvshmem-all-reduce.cu
 
 # Binaries
 CC := g++
