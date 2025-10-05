@@ -68,7 +68,9 @@ int main() {
     
     // Create events on device 0 for timing
     CUDACHECK(cudaSetDevice(0));
+    cudaStream_t stream;
     cudaEvent_t start, stop;
+    CUDACHECK(cudaStreamCreate(&stream));
     CUDACHECK(cudaEventCreate(&start));
     CUDACHECK(cudaEventCreate(&stop));
     
@@ -77,23 +79,23 @@ int main() {
     
     // Warm up run
     printf("\nPerforming warm-up transfer...\n");
-    CUDACHECK(cudaMemcpyAsync(d1_data, d0_data, dataSize, cudaMemcpyDeviceToDevice));
-    CUDACHECK(cudaDeviceSynchronize());
+    CUDACHECK(cudaMemcpyPeerAsync(d1_data, 1, d0_data, 0, dataSize, stream));
+    CUDACHECK(cudaStreamSynchronize(stream));
     
     // Timed transfer: Device 0 -> Device 1
     printf("\nStarting timed transfer: Device 0 -> Device 1\n");
     
     // Record start event
-    CUDACHECK(cudaEventRecord(start));
+    CUDACHECK(cudaEventRecord(start, stream));
     
     // Perform async memory copy
-    CUDACHECK(cudaMemcpyAsync(d1_data, d0_data, dataSize, cudaMemcpyDeviceToDevice));
+    CUDACHECK(cudaMemcpyPeerAsync(d1_data, 1, d0_data, 0, dataSize, stream));
     
     // Record stop event
-    CUDACHECK(cudaEventRecord(stop));
+    CUDACHECK(cudaEventRecord(stop, stream));
     
     // Wait for transfer to complete
-    CUDACHECK(cudaDeviceSynchronize());
+    CUDACHECK(cudaStreamSynchronize(stream));
     
     // Calculate elapsed time
     float milliseconds = 0;
